@@ -15,6 +15,7 @@ var (
 // rows in all tables in a database plus close the database
 // connection. It is satisfied by *sql.DB.
 type CleanUpDB interface {
+	Begin() (*sql.Tx, error)
 	Exec(query string, args ...interface{}) (sql.Result, error)
 	Query(query string, args ...interface{}) (*sql.Rows, error)
 
@@ -29,22 +30,15 @@ type CleanUpDB interface {
 // configuration only like goose_db_version (for migrations) or
 // the ones describing the internal configuration of the server. To be
 // used only in test code.
-func ResetSATestDatabase(t *testing.T) func() {
+func ResetSATestDatabase(t testing.TB) func() {
 	return resetTestDatabase(t, "sa")
 }
 
-// ResetPolicyTestDatabase deletes all rows in all tables in the Policy DB. It
-// acts the same as ResetSATestDatabase.
-func ResetPolicyTestDatabase(t *testing.T) func() {
-	return resetTestDatabase(t, "policy")
-}
-
-func resetTestDatabase(t *testing.T, dbType string) func() {
-	db, err := sql.Open("mysql", fmt.Sprintf("test_setup@tcp(localhost:3306)/boulder_%s_test", dbType))
+func resetTestDatabase(t testing.TB, dbType string) func() {
+	db, err := sql.Open("mysql", fmt.Sprintf("test_setup@tcp(boulder-mysql:3306)/boulder_%s_test", dbType))
 	if err != nil {
 		t.Fatalf("Couldn't create db: %s", err)
 	}
-	fmt.Printf("db %#v\n", db)
 	if err := deleteEverythingInAllTables(db); err != nil {
 		t.Fatalf("Failed to delete everything: %s", err)
 	}
@@ -52,7 +46,7 @@ func resetTestDatabase(t *testing.T, dbType string) func() {
 		if err := deleteEverythingInAllTables(db); err != nil {
 			t.Fatalf("Failed to truncate tables after the test: %s", err)
 		}
-		db.Close()
+		_ = db.Close()
 	}
 }
 
@@ -66,11 +60,38 @@ func deleteEverythingInAllTables(db CleanUpDB) error {
 		return err
 	}
 	for _, tn := range ts {
+		// We do this in a transaction to make sure that the foreign
+		// key checks remain disabled even if the db object chooses
+		// another connection to make the deletion on. Note that
+		// `alter table` statements will silently cause transactions
+		// to commit, so we do them outside of the transaction.
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("unable to start transaction to delete all rows from table %#v: %s", tn, err)
+		}
+		_, err = tx.Exec("set FOREIGN_KEY_CHECKS = 0")
+		if err != nil {
+			return fmt.Errorf("unable to disable FOREIGN_KEY_CHECKS to delete all rows from table %#v: %s", tn, err)
+		}
 		// 1 = 1 here prevents the MariaDB i_am_a_dummy setting from
 		// rejecting the DELETE for not having a WHERE clause.
-		_, err := db.Exec("delete from `" + tn + "` where 1 = 1")
+
+		_, err = tx.Exec("delete from `" + tn + "` where 1 = 1")
 		if err != nil {
-			return err
+			return fmt.Errorf("unable to delete all rows from table %#v: %s", tn, err)
+		}
+		_, err = tx.Exec("set FOREIGN_KEY_CHECKS = 1")
+		if err != nil {
+			return fmt.Errorf("unable to re-enable FOREIGN_KEY_CHECKS to delete all rows from table %#v: %s", tn, err)
+		}
+		err = tx.Commit()
+		if err != nil {
+			return fmt.Errorf("unable to commit transaction to delete all rows from table %#v: %s", tn, err)
+		}
+
+		_, err = db.Exec("alter table `" + tn + "` AUTO_INCREMENT = 1")
+		if err != nil {
+			return fmt.Errorf("unable to reset autoincrement on table %#v: %s", tn, err)
 		}
 	}
 	return err

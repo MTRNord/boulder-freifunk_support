@@ -7,8 +7,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/miekg/dns"
-	"github.com/letsencrypt/boulder/Godeps/_workspace/src/golang.org/x/net/context"
+	"github.com/miekg/dns"
+	"golang.org/x/net/context"
 )
 
 // MockDNSResolver is a mock
@@ -25,6 +25,12 @@ func (mock *MockDNSResolver) LookupTXT(_ context.Context, hostname string) ([]st
 		//               + "." + "9jg46WB3rR_AHD-EBXdN7cBkH1WOu0tA3M9fm21mqTI"))
 		// expected token + test account jwk thumbprint
 		return []string{"LPsIwTo7o8BoG0-vjCyGQGBWSVIPxI-i_X336eUOQZo"}, []string{"respect my authority!"}, nil
+	}
+	if hostname == "_acme-challenge.no-authority-dns01.com" {
+		// base64(sha256("LoqXcYV8q5ONbJQxbmR7SCTNo3tiAXDfowyjxAjEuX0"
+		//               + "." + "9jg46WB3rR_AHD-EBXdN7cBkH1WOu0tA3M9fm21mqTI"))
+		// expected token + test account jwk thumbprint
+		return []string{"LPsIwTo7o8BoG0-vjCyGQGBWSVIPxI-i_X336eUOQZo"}, nil, nil
 	}
 	return []string{"hostname"}, []string{"respect my authority!"}, nil
 }
@@ -56,10 +62,10 @@ func (mock *MockDNSResolver) LookupHost(_ context.Context, hostname string) ([]n
 		return []net.IP{}, nil
 	}
 	if hostname == "always.timeout" {
-		return []net.IP{}, &dnsError{dns.TypeA, "always.timeout", MockTimeoutError(), -1}
+		return []net.IP{}, &DNSError{dns.TypeA, "always.timeout", MockTimeoutError(), -1}
 	}
 	if hostname == "always.error" {
-		return []net.IP{}, &dnsError{dns.TypeA, "always.error", &net.OpError{
+		return []net.IP{}, &DNSError{dns.TypeA, "always.error", &net.OpError{
 			Err: errors.New("some net error"),
 		}, -1}
 	}
@@ -67,32 +73,64 @@ func (mock *MockDNSResolver) LookupHost(_ context.Context, hostname string) ([]n
 	return []net.IP{ip}, nil
 }
 
-// LookupCAA is a mock
+// LookupCAA returns mock records for use in tests.
 func (mock *MockDNSResolver) LookupCAA(_ context.Context, domain string) ([]*dns.CAA, error) {
 	var results []*dns.CAA
 	var record dns.CAA
 	switch strings.TrimRight(domain, ".") {
 	case "caa-timeout.com":
-		return nil, &dnsError{dns.TypeCAA, "always.timeout", MockTimeoutError(), -1}
+		return nil, &DNSError{dns.TypeCAA, "always.timeout", MockTimeoutError(), -1}
 	case "reserved.com":
 		record.Tag = "issue"
-		record.Value = "symantec.com"
+		record.Value = "ca.com"
 		results = append(results, &record)
 	case "critical.com":
 		record.Flag = 1
 		record.Tag = "issue"
-		record.Value = "symantec.com"
+		record.Value = "ca.com"
 		results = append(results, &record)
-	case "present.com":
+	case "present.com", "present.servfail.com":
 		record.Tag = "issue"
 		record.Value = "letsencrypt.org"
 		results = append(results, &record)
 	case "com":
-		// Nothing should ever call this, since CAA checking should stop when it
-		// reaches a public suffix.
-		fallthrough
-	case "servfail.com":
+		// com has no CAA records.
+		return nil, nil
+	case "servfail.com", "servfail.present.com":
 		return results, fmt.Errorf("SERVFAIL")
+	case "multi-crit-present.com":
+		record.Flag = 1
+		record.Tag = "issue"
+		record.Value = "ca.com"
+		results = append(results, &record)
+		secondRecord := record
+		secondRecord.Value = "letsencrypt.org"
+		results = append(results, &secondRecord)
+	case "unknown-critical.com":
+		record.Flag = 128
+		record.Tag = "foo"
+		record.Value = "bar"
+		results = append(results, &record)
+	case "unknown-critical2.com":
+		record.Flag = 1
+		record.Tag = "foo"
+		record.Value = "bar"
+		results = append(results, &record)
+	case "unknown-noncritical.com":
+		record.Flag = 0x7E // all bits we don't treat as meaning "critical"
+		record.Tag = "foo"
+		record.Value = "bar"
+		results = append(results, &record)
+	case "present-with-parameter.com":
+		record.Tag = "issue"
+		record.Value = "  letsencrypt.org  ;foo=bar;baz=bar"
+		results = append(results, &record)
+	case "unsatisfiable.com":
+		record.Tag = "issue"
+		record.Value = ";"
+		results = append(results, &record)
+	case "bad-local-resolver.com":
+		return nil, DNSError{underlying: MockTimeoutError()}
 	}
 	return results, nil
 }

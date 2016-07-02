@@ -1,8 +1,3 @@
-// Copyright 2015 ISRG.  All rights reserved
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
-
 package cmd
 
 import (
@@ -13,10 +8,11 @@ import (
 	"strings"
 	"time"
 
-	cfsslConfig "github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/cloudflare/cfssl/config"
-	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/cloudflare/cfssl/crypto/pkcs11key"
+	cfsslConfig "github.com/cloudflare/cfssl/config"
+	"github.com/letsencrypt/pkcs11key"
+
 	"github.com/letsencrypt/boulder/core"
-	"github.com/letsencrypt/boulder/va"
+	"github.com/letsencrypt/boulder/goodkey"
 )
 
 // Config stores configuration parameters that applications
@@ -25,79 +21,9 @@ import (
 //
 // Note: NO DEFAULTS are provided.
 type Config struct {
-	ActivityMonitor struct {
-		ServiceConfig
-	}
-
 	// Default AMQPConfig for services that don't specify one.
 	// TODO(jsha): Delete this after a deploy.
 	AMQP *AMQPConfig
-
-	WFE struct {
-		ServiceConfig
-		BaseURL       string
-		ListenAddress string
-
-		AllowOrigins []string
-
-		CertCacheDuration           string
-		CertNoCacheExpirationWindow string
-		IndexCacheDuration          string
-		IssuerCacheDuration         string
-
-		ShutdownStopTimeout string
-		ShutdownKillTimeout string
-	}
-
-	CA CAConfig
-
-	RA struct {
-		ServiceConfig
-
-		RateLimitPoliciesFilename string
-
-		MaxConcurrentRPCServerRequests int64
-
-		MaxContactsPerRegistration int
-
-		// UseIsSafeDomain determines whether to call VA.IsSafeDomain
-		UseIsSafeDomain bool // TODO(jmhodges): remove after va IsSafeDomain deploy
-
-		// The number of times to try a DNS query (that has a temporary error)
-		// before giving up. May be short-circuited by deadlines. A zero value
-		// will be turned into 1.
-		DNSTries int
-	}
-
-	SA struct {
-		ServiceConfig
-		DBConfig
-
-		MaxConcurrentRPCServerRequests int64
-	}
-
-	VA struct {
-		ServiceConfig
-
-		UserAgent string
-
-		IssuerDomain string
-
-		PortConfig va.PortConfig
-
-		MaxConcurrentRPCServerRequests int64
-
-		GoogleSafeBrowsing *GoogleSafeBrowsingConfig
-
-		// The number of times to try a DNS query (that has a temporary error)
-		// before giving up. May be short-circuited by deadlines. A zero value
-		// will be turned into 1.
-		DNSTries int
-	}
-
-	SQL struct {
-		SQLDebug bool
-	}
 
 	Statsd StatsdConfig
 
@@ -113,13 +39,10 @@ type Config struct {
 	Mailer struct {
 		ServiceConfig
 		DBConfig
+		SMTPConfig
 
-		Server   string
-		Port     string
-		Username string
-		Password string
-		From     string
-		Subject  string
+		From    string
+		Subject string
 
 		CertLimit int
 		NagTimes  []string
@@ -155,14 +78,8 @@ type Config struct {
 
 	Publisher struct {
 		ServiceConfig
+		SubmissionTimeout              ConfigDuration
 		MaxConcurrentRPCServerRequests int64
-	}
-
-	ExternalCertImporter struct {
-		CertsToImportCSVFilename   string
-		DomainsToImportCSVFilename string
-		CertsToRemoveCSVFilename   string
-		StatsdRate                 float32
 	}
 
 	PA PAConfig
@@ -184,12 +101,17 @@ type Config struct {
 
 	CertChecker struct {
 		DBConfig
+		HostnamePolicyConfig
 
 		Workers             int
 		ReportDirectoryPath string
+		UnexpiredOnly       bool
+		BadResultsOnly      bool
+		CheckPeriod         ConfigDuration
 	}
 	AllowedSigningAlgos *AllowedSigningAlgos
 
+	// TODO: remove after production configs use SubscriberAgreementURL in the wfe section
 	SubscriberAgreementURL string
 }
 
@@ -203,18 +125,38 @@ type AllowedSigningAlgos struct {
 }
 
 // KeyPolicy returns a KeyPolicy reflecting the Boulder configuration.
-func (config *Config) KeyPolicy() core.KeyPolicy {
-	if config.AllowedSigningAlgos != nil {
-		return core.KeyPolicy{
-			AllowRSA:           config.AllowedSigningAlgos.RSA,
-			AllowECDSANISTP256: config.AllowedSigningAlgos.ECDSANISTP256,
-			AllowECDSANISTP384: config.AllowedSigningAlgos.ECDSANISTP384,
-			AllowECDSANISTP521: config.AllowedSigningAlgos.ECDSANISTP521,
+func (asa *AllowedSigningAlgos) KeyPolicy() goodkey.KeyPolicy {
+	if asa != nil {
+		return goodkey.KeyPolicy{
+			AllowRSA:           asa.RSA,
+			AllowECDSANISTP256: asa.ECDSANISTP256,
+			AllowECDSANISTP384: asa.ECDSANISTP384,
+			AllowECDSANISTP521: asa.ECDSANISTP521,
 		}
 	}
-	return core.KeyPolicy{
+	return goodkey.KeyPolicy{
 		AllowRSA: true,
 	}
+}
+
+// PasswordConfig either contains a password or the path to a file
+// containing a password
+type PasswordConfig struct {
+	Password     string
+	PasswordFile string
+}
+
+// Pass returns a password, either directly from the configuration
+// struct or by reading from a specified file
+func (pc *PasswordConfig) Pass() (string, error) {
+	if pc.PasswordFile != "" {
+		contents, err := ioutil.ReadFile(pc.PasswordFile)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimRight(string(contents), "\n"), nil
+	}
+	return pc.Password, nil
 }
 
 // ServiceConfig contains config items that are common to all our services, to
@@ -223,6 +165,7 @@ type ServiceConfig struct {
 	// DebugAddr is the address to run the /debug handlers on.
 	DebugAddr string
 	AMQP      *AMQPConfig
+	GRPC      *GRPCServerConfig
 }
 
 // DBConfig defines how to connect to a database. The connect string may be
@@ -232,6 +175,7 @@ type DBConfig struct {
 	DBConnect string
 	// A file containing a connect URL for the DB.
 	DBConnectFile string
+	MaxDBConns    int
 }
 
 // URL returns the DBConnect URL represented by this DBConfig object, either
@@ -242,6 +186,13 @@ func (d *DBConfig) URL() (string, error) {
 		return string(url), err
 	}
 	return d.DBConnect, nil
+}
+
+type SMTPConfig struct {
+	PasswordConfig
+	Server   string
+	Port     string
+	Username string
 }
 
 // AMQPConfig describes how to connect to AMQP, and how to speak to each of the
@@ -287,14 +238,20 @@ func (a *AMQPConfig) ServerURL() (string, error) {
 type CAConfig struct {
 	ServiceConfig
 	DBConfig
+	HostnamePolicyConfig
 
-	Profile      string
+	RSAProfile   string
+	ECDSAProfile string
 	TestMode     bool
 	SerialPrefix int
-	Key          KeyConfig
+	// TODO(jsha): Remove Key field once we've migrated to Issuers
+	Key *IssuerConfig
+	// Issuers contains configuration information for each issuer cert and key
+	// this CA knows about. The first in the list is used as the default.
+	Issuers []IssuerConfig
 	// LifespanOCSP is how long OCSP responses are valid for; It should be longer
 	// than the minTimeToExpiry field for the OCSP Updater.
-	LifespanOCSP string
+	LifespanOCSP ConfigDuration
 	// How long issued certificates are valid for, should match expiry field
 	// in cfssl config.
 	Expiry string
@@ -304,7 +261,16 @@ type CAConfig struct {
 
 	MaxConcurrentRPCServerRequests int64
 
-	HSMFaultTimeout ConfigDuration
+	// DoNotForceCN is a temporary config setting. It controls whether
+	// to add a certificate's serial to its Subject, and whether to
+	// not pull a SAN entry to be the CN if no CN was given in a CSR.
+	DoNotForceCN bool
+
+	// EnableMustStaple governs whether the Must Staple extension in CSRs
+	// triggers issuance of certificates with Must Staple.
+	EnableMustStaple bool
+
+	PublisherService *GRPCClientConfig
 }
 
 // PAConfig specifies how a policy authority should connect to its
@@ -314,6 +280,12 @@ type PAConfig struct {
 	DBConfig
 	EnforcePolicyWhitelist bool
 	Challenges             map[string]bool
+}
+
+// HostnamePolicyConfig specifies a file from which to load a policy regarding
+// what hostnames to issue for.
+type HostnamePolicyConfig struct {
+	HostnamePolicyFile string
 }
 
 // CheckChallenges checks whether the list of challenges in the PA config
@@ -330,13 +302,15 @@ func (pc PAConfig) CheckChallenges() error {
 	return nil
 }
 
-// KeyConfig should contain either a File path to a PEM-format private key,
+// IssuerConfig contains info about an issuer: private key and issuer cert.
+// It should contain either a File path to a PEM-format private key,
 // or a PKCS11Config defining how to load a module for an HSM.
-type KeyConfig struct {
+type IssuerConfig struct {
 	// A file from which a pkcs11key.Config will be read and parsed, if present
 	ConfigFile string
 	File       string
 	PKCS11     *pkcs11key.Config
+	CertFile   string
 }
 
 // TLSConfig reprents certificates and a key for authenticated TLS.
@@ -381,6 +355,8 @@ type OCSPUpdaterConfig struct {
 
 	SignFailureBackoffFactor float64
 	SignFailureBackoffMax    ConfigDuration
+
+	Publisher *GRPCClientConfig
 }
 
 // GoogleSafeBrowsingConfig is the JSON config struct for the VA's use of the
@@ -392,9 +368,8 @@ type GoogleSafeBrowsingConfig struct {
 
 // SyslogConfig defines the config for syslogging.
 type SyslogConfig struct {
-	Network     string
-	Server      string
-	StdoutLevel *int
+	StdoutLevel int
+	SyslogLevel int
 }
 
 // StatsdConfig defines the config for Statsd.
@@ -456,4 +431,37 @@ func (d *ConfigDuration) UnmarshalYAML(unmarshal func(interface{}) error) error 
 type LogDescription struct {
 	URI string
 	Key string
+}
+
+// GRPCClientConfig contains the information needed to talk to the gRPC service
+type GRPCClientConfig struct {
+	ServerAddresses       []string
+	ServerIssuerPath      string
+	ClientCertificatePath string
+	ClientKeyPath         string
+	Timeout               ConfigDuration
+}
+
+// GRPCServerConfig contains the information needed to run a gRPC service
+type GRPCServerConfig struct {
+	Address               string `json:"address" yaml:"address"`
+	ServerCertificatePath string `json:"serverCertificatePath" yaml:"server-certificate-path"`
+	ServerKeyPath         string `json:"serverKeyPath" yaml:"server-key-path"`
+	ClientIssuerPath      string `json:"clientIssuerPath" yaml:"client-issuer-path"`
+}
+
+// PortConfig specifies what ports the VA should call to on the remote
+// host when performing its checks.
+type PortConfig struct {
+	HTTPPort  int
+	HTTPSPort int
+	TLSPort   int
+}
+
+// CAADistributedResolverConfig specifies the HTTP client setup and interfaces
+// needed to resolve CAA addresses over multiple paths
+type CAADistributedResolverConfig struct {
+	Timeout     ConfigDuration
+	MaxFailures int
+	Proxies     []string
 }

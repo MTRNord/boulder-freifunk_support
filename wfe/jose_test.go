@@ -6,12 +6,12 @@ import (
 	"crypto/rsa"
 	"testing"
 
-	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/letsencrypt/go-jose"
+	"github.com/square/go-jose"
 )
 
 func TestRejectsNone(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	_, _, _, prob := wfe.verifyPOST(newRequestEvent(), makePostRequest(`
+	_, _, _, prob := wfe.verifyPOST(ctx, newRequestEvent(), makePostRequest(`
 		{
 			"header": {
 				"alg": "none",
@@ -35,7 +35,7 @@ func TestRejectsNone(t *testing.T) {
 
 func TestRejectsHS256(t *testing.T) {
 	wfe, _ := setupWFE(t)
-	_, _, _, prob := wfe.verifyPOST(newRequestEvent(), makePostRequest(`
+	_, _, _, prob := wfe.verifyPOST(ctx, newRequestEvent(), makePostRequest(`
 		{
 			"header": {
 				"alg": "HS256",
@@ -79,7 +79,7 @@ func TestCheckAlgorithm(t *testing.T) {
 			},
 			jose.JsonWebSignature{
 				Signatures: []jose.Signature{
-					jose.Signature{
+					{
 						Header: jose.JoseHeader{
 							Algorithm: "HS256",
 						},
@@ -96,7 +96,7 @@ func TestCheckAlgorithm(t *testing.T) {
 			},
 			jose.JsonWebSignature{
 				Signatures: []jose.Signature{
-					jose.Signature{
+					{
 						Header: jose.JoseHeader{
 							Algorithm: "HS256",
 						},
@@ -113,7 +113,7 @@ func TestCheckAlgorithm(t *testing.T) {
 			},
 			jose.JsonWebSignature{
 				Signatures: []jose.Signature{
-					jose.Signature{
+					{
 						Header: jose.JoseHeader{
 							Algorithm: "RS256",
 						},
@@ -141,7 +141,7 @@ func TestCheckAlgorithmSuccess(t *testing.T) {
 		Key:       &rsa.PublicKey{},
 	}, &jose.JsonWebSignature{
 		Signatures: []jose.Signature{
-			jose.Signature{
+			{
 				Header: jose.JoseHeader{
 					Algorithm: "RS256",
 				},
@@ -155,7 +155,7 @@ func TestCheckAlgorithmSuccess(t *testing.T) {
 		Key: &rsa.PublicKey{},
 	}, &jose.JsonWebSignature{
 		Signatures: []jose.Signature{
-			jose.Signature{
+			{
 				Header: jose.JoseHeader{
 					Algorithm: "RS256",
 				},
@@ -173,7 +173,7 @@ func TestCheckAlgorithmSuccess(t *testing.T) {
 		},
 	}, &jose.JsonWebSignature{
 		Signatures: []jose.Signature{
-			jose.Signature{
+			{
 				Header: jose.JoseHeader{
 					Algorithm: "ES256",
 				},
@@ -190,7 +190,7 @@ func TestCheckAlgorithmSuccess(t *testing.T) {
 		},
 	}, &jose.JsonWebSignature{
 		Signatures: []jose.Signature{
-			jose.Signature{
+			{
 				Header: jose.JoseHeader{
 					Algorithm: "ES256",
 				},

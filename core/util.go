@@ -1,20 +1,10 @@
-// Copyright 2014 ISRG.  All rights reserved
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
-
 package core
 
 import (
 	"crypto"
-	"crypto/ecdsa"
 	"crypto/rand"
-	"crypto/rsa"
-	"crypto/sha1"
 	"crypto/sha256"
-	"crypto/sha512"
 	"crypto/x509"
-	"encoding/asn1"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -22,7 +12,6 @@ import (
 	"errors"
 	"expvar"
 	"fmt"
-	"hash"
 	"io"
 	"io/ioutil"
 	"math/big"
@@ -30,12 +19,14 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
+	"unicode"
 
-	jose "github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/letsencrypt/go-jose"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/probs"
+	jose "github.com/square/go-jose"
 )
 
 // Package Variables Variables
@@ -85,10 +76,6 @@ type LengthRequiredError string
 // the user client.
 type SignatureValidationError string
 
-// CertificateIssuanceError indicates the certificate failed to be issued
-// for some reason.
-type CertificateIssuanceError string
-
 // NoSuchRegistrationError indicates that a registration could not be found.
 type NoSuchRegistrationError string
 
@@ -98,10 +85,6 @@ type RateLimitedError string
 // TooManyRPCRequestsError indicates an RPC server has hit it's concurrent request
 // limit
 type TooManyRPCRequestsError string
-
-// ServiceUnavailableError indicates that a component is not available to
-// satisfy a request
-type ServiceUnavailableError string
 
 // BadNonceError indicates an empty of invalid nonce was provided
 type BadNonceError string
@@ -113,11 +96,9 @@ func (e UnauthorizedError) Error() string        { return string(e) }
 func (e NotFoundError) Error() string            { return string(e) }
 func (e LengthRequiredError) Error() string      { return string(e) }
 func (e SignatureValidationError) Error() string { return string(e) }
-func (e CertificateIssuanceError) Error() string { return string(e) }
 func (e NoSuchRegistrationError) Error() string  { return string(e) }
 func (e RateLimitedError) Error() string         { return string(e) }
 func (e TooManyRPCRequestsError) Error() string  { return string(e) }
-func (e ServiceUnavailableError) Error() string  { return string(e) }
 func (e BadNonceError) Error() string            { return string(e) }
 
 // statusTooManyRequests is the HTTP status code meant for rate limiting
@@ -151,11 +132,7 @@ func ProblemDetailsForError(err error, msg string) *probs.ProblemDetails {
 	case SignatureValidationError:
 		return probs.Malformed(fmt.Sprintf("%s :: %s", msg, err))
 	case RateLimitedError:
-		return &probs.ProblemDetails{
-			Type:       probs.RateLimitedProblem,
-			Detail:     fmt.Sprintf("%s :: %s", msg, err),
-			HTTPStatus: statusTooManyRequests,
-		}
+		return probs.RateLimited(fmt.Sprintf("%s :: %s", msg, err))
 	case BadNonceError:
 		return probs.BadNonce(fmt.Sprintf("%s :: %s", msg, err))
 	default:
@@ -172,9 +149,7 @@ func RandomString(byteLength int) string {
 	b := make([]byte, byteLength)
 	_, err := io.ReadFull(rand.Reader, b)
 	if err != nil {
-		ohdear := "RandomString entropy failure? " + err.Error()
-		logger := blog.GetAuditLogger()
-		logger.EmergencyExit(ohdear)
+		panic(fmt.Sprintf("Error reading random bytes: %s", err))
 	}
 	return base64.RawURLEncoding.EncodeToString(b)
 }
@@ -216,7 +191,7 @@ func KeyDigest(key crypto.PublicKey) (string, error) {
 	default:
 		keyDER, err := x509.MarshalPKIXPublicKey(key)
 		if err != nil {
-			logger := blog.GetAuditLogger()
+			logger := blog.Get()
 			logger.Debug(fmt.Sprintf("Problem marshaling public key: %s", err))
 			return "", err
 		}
@@ -283,76 +258,6 @@ func (u *AcmeURL) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// VerifyCSR verifies that a Certificate Signature Request is well-formed.
-//
-// Note: this is the missing CertificateRequest.Verify() method
-func VerifyCSR(csr *x509.CertificateRequest) error {
-	// Compute the hash of the TBSCertificateRequest
-	var hashID crypto.Hash
-	var hash hash.Hash
-	switch csr.SignatureAlgorithm {
-	case x509.SHA1WithRSA:
-		fallthrough
-	case x509.ECDSAWithSHA1:
-		hashID = crypto.SHA1
-		hash = sha1.New()
-	case x509.SHA256WithRSA:
-		fallthrough
-	case x509.ECDSAWithSHA256:
-		hashID = crypto.SHA256
-		hash = sha256.New()
-	case x509.SHA384WithRSA:
-		fallthrough
-	case x509.ECDSAWithSHA384:
-		hashID = crypto.SHA384
-		hash = sha512.New384()
-	case x509.SHA512WithRSA:
-		fallthrough
-	case x509.ECDSAWithSHA512:
-		hashID = crypto.SHA512
-		hash = sha512.New()
-	default:
-		return errors.New("Unsupported CSR signing algorithm")
-	}
-	_, _ = hash.Write(csr.RawTBSCertificateRequest) // Never returns an error
-	inputHash := hash.Sum(nil)
-
-	// Verify the signature using the public key in the CSR
-	switch csr.SignatureAlgorithm {
-	case x509.SHA1WithRSA:
-		fallthrough
-	case x509.SHA256WithRSA:
-		fallthrough
-	case x509.SHA384WithRSA:
-		fallthrough
-	case x509.SHA512WithRSA:
-		rsaKey := csr.PublicKey.(*rsa.PublicKey)
-		return rsa.VerifyPKCS1v15(rsaKey, hashID, inputHash, csr.Signature)
-	case x509.ECDSAWithSHA1:
-		fallthrough
-	case x509.ECDSAWithSHA256:
-		fallthrough
-	case x509.ECDSAWithSHA384:
-		fallthrough
-	case x509.ECDSAWithSHA512:
-		ecKey := csr.PublicKey.(*ecdsa.PublicKey)
-
-		var sig struct{ R, S *big.Int }
-		_, err := asn1.Unmarshal(csr.Signature, &sig)
-		if err != nil {
-			return err
-		}
-
-		if ecdsa.Verify(ecKey, inputHash, sig.R, sig.S) {
-			return nil
-		}
-
-		return errors.New("Invalid ECDSA signature on CSR")
-	}
-
-	return errors.New("Unsupported CSR signing algorithm")
-}
-
 // SerialToString converts a certificate serial number (big.Int) to a String
 // consistently.
 func SerialToString(serial *big.Int) string {
@@ -415,7 +320,8 @@ func GetBuildHost() (retID string) {
 }
 
 // UniqueLowerNames returns the set of all unique names in the input after all
-// of them are lowercased. The returned names will be in their lowercased form.
+// of them are lowercased. The returned names will be in their lowercased form
+// and sorted alphabetically.
 func UniqueLowerNames(names []string) (unique []string) {
 	nameMap := make(map[string]int, len(names))
 	for _, name := range names {
@@ -426,6 +332,7 @@ func UniqueLowerNames(names []string) (unique []string) {
 	for name := range nameMap {
 		unique = append(unique, name)
 	}
+	sort.Strings(unique)
 	return
 }
 
@@ -497,4 +404,15 @@ func RetryBackoff(retries int, base, max time.Duration, factor float64) time.Dur
 	// the same time, they won't operate in lockstep.
 	backoff *= (1 - retryJitter) + 2*retryJitter*mrand.Float64()
 	return time.Duration(backoff)
+}
+
+// IsASCII determines if every character in a string is encoded in
+// the ASCII character set.
+func IsASCII(str string) bool {
+	for _, r := range str {
+		if r > unicode.MaxASCII {
+			return false
+		}
+	}
+	return true
 }

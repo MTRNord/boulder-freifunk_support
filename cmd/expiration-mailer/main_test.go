@@ -1,8 +1,3 @@
-// Copyright 2015 ISRG.  All rights reserved
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
-
 package main
 
 import (
@@ -19,15 +14,18 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/cactus/go-statsd-client/statsd"
-	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/jmhodges/clock"
-	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/letsencrypt/go-jose"
-	"github.com/letsencrypt/boulder/Godeps/_workspace/src/gopkg.in/gorp.v1"
+	"golang.org/x/net/context"
+
+	"github.com/cactus/go-statsd-client/statsd"
+	"github.com/jmhodges/clock"
+	"github.com/square/go-jose"
+	"gopkg.in/gorp.v1"
 
 	"github.com/letsencrypt/boulder/core"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/mocks"
 	"github.com/letsencrypt/boulder/sa"
+	"github.com/letsencrypt/boulder/sa/satest"
 	"github.com/letsencrypt/boulder/test"
 	"github.com/letsencrypt/boulder/test/vars"
 )
@@ -47,7 +45,7 @@ type fakeRegStore struct {
 	RegByID map[int64]core.Registration
 }
 
-func (f fakeRegStore) GetRegistration(id int64) (core.Registration, error) {
+func (f fakeRegStore) GetRegistration(ctx context.Context, id int64) (core.Registration, error) {
 	r, ok := f.RegByID[id]
 	if !ok {
 		msg := fmt.Sprintf("no such registration %d", id)
@@ -72,9 +70,14 @@ func newFakeClock(t *testing.T) clock.FakeClock {
 }
 
 const testTmpl = `hi, cert for DNS names {{.DNSNames}} is going to expire in {{.DaysToExpiration}} days ({{.ExpirationDate}})`
+const testEmailSubject = `email subject for test`
+const emailARaw = "rolandshoemaker@gmail.com"
+const emailBRaw = "test@gmail.com"
 
 var (
-	jsonKeyA = []byte(`{
+	emailA, _ = core.ParseAcmeURL("mailto:" + emailARaw)
+	emailB, _ = core.ParseAcmeURL("mailto:" + emailBRaw)
+	jsonKeyA  = []byte(`{
   "kty":"RSA",
   "n":"0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw",
   "e":"AQAB"
@@ -84,8 +87,14 @@ var (
   "n":"z8bp-jPtHt4lKBqepeKF28g_QAEOuEsCIou6sZ9ndsQsEjxEOQxQ0xNOQezsKa63eogw8YS3vzjUcPP5BJuVzfPfGd5NVUdT-vSSwxk3wvk_jtNqhrpcoG0elRPQfMVsQWmxCAXCVRz3xbcFI8GTe-syynG3l-g1IzYIIZVNI6jdljCZML1HOMTTW4f7uJJ8mM-08oQCeHbr5ejK7O2yMSSYxW03zY-Tj1iVEebROeMv6IEEJNFSS4yM-hLpNAqVuQxFGetwtwjDMC1Drs1dTWrPuUAAjKGrP151z1_dE74M5evpAhZUmpKv1hY-x85DC6N0hFPgowsanmTNNiV75w",
   "e":"AAEAAQ"
 }`)
-	log  = mocks.UseMockLog()
+	jsonKeyC = []byte(`{
+  "kty":"RSA",
+  "n":"rFH5kUBZrlPj73epjJjyCxzVzZuV--JjKgapoqm9pOuOt20BUTdHqVfC2oDclqM7HFhkkX9OSJMTHgZ7WaVqZv9u1X2yjdx9oVmMLuspX7EytW_ZKDZSzL-sCOFCuQAuYKkLbsdcA3eHBK_lwc4zwdeHFMKIulNvLqckkqYB9s8GpgNXBDIQ8GjR5HuJke_WUNjYHSd8jY1LU9swKWsLQe2YoQUz_ekQvBvBCoaFEtrtRaSJKNLIVDObXFr2TLIiFiM0Em90kK01-eQ7ZiruZTKomll64bRFPoNo4_uwubddg3xTqur2vdF3NyhTrYdvAgTem4uC0PFjEQ1bK_djBQ",
+  "e":"AQAB"
+}`)
+	log  = blog.UseMock()
 	tmpl = template.Must(template.New("expiry-email").Parse(testTmpl))
+	ctx  = context.Background()
 )
 
 func TestSendNags(t *testing.T) {
@@ -98,6 +107,7 @@ func TestSendNags(t *testing.T) {
 		stats:         stats,
 		mailer:        &mc,
 		emailTemplate: tmpl,
+		subject:       testEmailSubject,
 		rs:            rs,
 		clk:           fc,
 	}
@@ -110,25 +120,42 @@ func TestSendNags(t *testing.T) {
 		DNSNames: []string{"example.com"},
 	}
 
-	email, _ := core.ParseAcmeURL("mailto:rolandshoemaker@gmail.com")
-	emailB, _ := core.ParseAcmeURL("mailto:test@gmail.com")
-
-	err := m.sendNags(cert, []*core.AcmeURL{email})
+	err := m.sendNags([]*core.AcmeURL{emailA}, []*x509.Certificate{cert})
 	test.AssertNotError(t, err, "Failed to send warning messages")
 	test.AssertEquals(t, len(mc.Messages), 1)
-	test.AssertEquals(t, fmt.Sprintf(`hi, cert for DNS names example.com is going to expire in 2 days (%s)`, cert.NotAfter), mc.Messages[0])
+	test.AssertEquals(t, mocks.MailerMessage{
+		To:      emailARaw,
+		Subject: testEmailSubject,
+		Body:    fmt.Sprintf(`hi, cert for DNS names example.com is going to expire in 2 days (%s)`, cert.NotAfter.Format(time.RFC822Z)),
+	}, mc.Messages[0])
 
 	mc.Clear()
-	err = m.sendNags(cert, []*core.AcmeURL{email, emailB})
+	err = m.sendNags([]*core.AcmeURL{emailA, emailB}, []*x509.Certificate{cert})
 	test.AssertNotError(t, err, "Failed to send warning messages")
 	test.AssertEquals(t, len(mc.Messages), 2)
-	test.AssertEquals(t, fmt.Sprintf(`hi, cert for DNS names example.com is going to expire in 2 days (%s)`, cert.NotAfter), mc.Messages[0])
-	test.AssertEquals(t, fmt.Sprintf(`hi, cert for DNS names example.com is going to expire in 2 days (%s)`, cert.NotAfter), mc.Messages[1])
+	test.AssertEquals(t, mocks.MailerMessage{
+		To:      emailARaw,
+		Subject: testEmailSubject,
+		Body:    fmt.Sprintf(`hi, cert for DNS names example.com is going to expire in 2 days (%s)`, cert.NotAfter.Format(time.RFC822Z)),
+	}, mc.Messages[0])
+	test.AssertEquals(t, mocks.MailerMessage{
+		To:      emailBRaw,
+		Subject: testEmailSubject,
+		Body:    fmt.Sprintf(`hi, cert for DNS names example.com is going to expire in 2 days (%s)`, cert.NotAfter.Format(time.RFC822Z)),
+	}, mc.Messages[1])
 
 	mc.Clear()
-	err = m.sendNags(cert, []*core.AcmeURL{})
+	err = m.sendNags([]*core.AcmeURL{}, []*x509.Certificate{cert})
 	test.AssertNotError(t, err, "Not an error to pass no email contacts")
 	test.AssertEquals(t, len(mc.Messages), 0)
+
+	templates, err := template.ParseGlob("../../data/*.template")
+	test.AssertNotError(t, err, "Failed to parse templates")
+	for _, template := range templates.Templates() {
+		m.emailTemplate = template
+		err = m.sendNags(nil, []*x509.Certificate{cert})
+		test.AssertNotError(t, err, "failed to send nag")
+	}
 }
 
 var n = bigIntFromB64("n4EPtAOCc9AlkeQHPzHStgAbgs7bTZLwUBZdR8_KuKPEHLd4rHVTeT-O-XV2jRojdNhxJWTDvNd7nqQ0VEiZQHz_AJmSCpMaJMRBSFKrKb2wqVwGU_NsYOYL-QtiWN2lbzcEe6XC0dApr5ydQLrHqkHHig3RBordaZ6Aj-oBHqFEHYpPe7Tpe-OfVfHd1E6cS6M1FZcD1NNLYD5lFHpPI9bTwJlsde3uhGqC0ZCuEHg8lhzwOHrtIQbS0FVbb9k3-tVTU4fg_3L_vniUFAKwuCLqKnS2BYwdq_mzSnbLY7h_qixoR7jig3__kRhuaxwUkRz5iaiQkqgc5gHdrNP5zw==")
@@ -137,6 +164,19 @@ var d = bigIntFromB64("bWUC9B-EFRIo8kpGfh0ZuyGPvMNKvYWNtB_ikiH9k20eT-O1q_I78eiZk
 var p = bigIntFromB64("uKE2dh-cTf6ERF4k4e_jy78GfPYUIaUyoSSJuBzp3Cubk3OCqs6grT8bR_cu0Dm1MZwWmtdqDyI95HrUeq3MP15vMMON8lHTeZu2lmKvwqW7anV5UzhM1iZ7z4yMkuUwFWoBvyY898EXvRD-hdqRxHlSqAZ192zB3pVFJ0s7pFc=")
 var q = bigIntFromB64("uKE2dh-cTf6ERF4k4e_jy78GfPYUIaUyoSSJuBzp3Cubk3OCqs6grT8bR_cu0Dm1MZwWmtdqDyI95HrUeq3MP15vMMON8lHTeZu2lmKvwqW7anV5UzhM1iZ7z4yMkuUwFWoBvyY898EXvRD-hdqRxHlSqAZ192zB3pVFJ0s7pFc=")
 
+var serial1 = big.NewInt(1336)
+var serial1String = core.SerialToString(serial1)
+var serial2 = big.NewInt(1337)
+var serial2String = core.SerialToString(serial2)
+var serial3 = big.NewInt(1338)
+var serial3String = core.SerialToString(serial3)
+var serial4 = big.NewInt(1339)
+var serial4String = core.SerialToString(serial4)
+var serial5 = big.NewInt(1340)
+var serial5String = core.SerialToString(serial5)
+var serial6 = big.NewInt(1341)
+var serial7 = big.NewInt(1342)
+
 var testKey = rsa.PrivateKey{
 	PublicKey: rsa.PublicKey{N: n, E: e},
 	D:         d,
@@ -144,25 +184,26 @@ var testKey = rsa.PrivateKey{
 }
 
 func TestFindExpiringCertificates(t *testing.T) {
-	ctx := setup(t, []time.Duration{time.Hour * 24, time.Hour * 24 * 4, time.Hour * 24 * 7})
+	testCtx := setup(t, []time.Duration{time.Hour * 24, time.Hour * 24 * 4, time.Hour * 24 * 7})
 
 	log.Clear()
-	err := ctx.m.findExpiringCertificates()
+	err := testCtx.m.findExpiringCertificates()
 	test.AssertNotError(t, err, "Failed on no certificates")
 	test.AssertEquals(t, len(log.GetAllMatching("Searching for certificates that expire between.*")), 3)
 
 	// Add some expiring certificates and registrations
-	emailA, _ := core.ParseAcmeURL("mailto:one@mail.com")
-	emailB, _ := core.ParseAcmeURL("mailto:twp@mail.com")
 	var keyA jose.JsonWebKey
 	var keyB jose.JsonWebKey
+	var keyC jose.JsonWebKey
 	err = json.Unmarshal(jsonKeyA, &keyA)
 	test.AssertNotError(t, err, "Failed to unmarshal public JWK")
 	err = json.Unmarshal(jsonKeyB, &keyB)
 	test.AssertNotError(t, err, "Failed to unmarshal public JWK")
+	err = json.Unmarshal(jsonKeyC, &keyC)
+	test.AssertNotError(t, err, "Failed to unmarshal public JWK")
 	regA := core.Registration{
 		ID: 1,
-		Contact: []*core.AcmeURL{
+		Contact: &[]*core.AcmeURL{
 			emailA,
 		},
 		Key:       keyA,
@@ -170,19 +211,31 @@ func TestFindExpiringCertificates(t *testing.T) {
 	}
 	regB := core.Registration{
 		ID: 2,
-		Contact: []*core.AcmeURL{
+		Contact: &[]*core.AcmeURL{
 			emailB,
 		},
 		Key:       keyB,
 		InitialIP: net.ParseIP("2.3.2.3"),
 	}
-	regA, err = ctx.ssa.NewRegistration(regA)
+	regC := core.Registration{
+		ID: 3,
+		Contact: &[]*core.AcmeURL{
+			emailB,
+		},
+		Key:       keyC,
+		InitialIP: net.ParseIP("210.3.2.3"),
+	}
+	regA, err = testCtx.ssa.NewRegistration(ctx, regA)
 	if err != nil {
 		t.Fatalf("Couldn't store regA: %s", err)
 	}
-	regB, err = ctx.ssa.NewRegistration(regB)
+	regB, err = testCtx.ssa.NewRegistration(ctx, regB)
 	if err != nil {
 		t.Fatalf("Couldn't store regB: %s", err)
+	}
+	regC, err = testCtx.ssa.NewRegistration(ctx, regC)
+	if err != nil {
+		t.Fatalf("Couldn't store regC: %s", err)
 	}
 
 	// Expires in <1d, last nag was the 4d nag
@@ -190,20 +243,20 @@ func TestFindExpiringCertificates(t *testing.T) {
 		Subject: pkix.Name{
 			CommonName: "happy A",
 		},
-		NotAfter:     ctx.fc.Now().Add(23 * time.Hour),
+		NotAfter:     testCtx.fc.Now().Add(23 * time.Hour),
 		DNSNames:     []string{"example-a.com"},
-		SerialNumber: big.NewInt(1337),
+		SerialNumber: serial1,
 	}
 	certDerA, _ := x509.CreateCertificate(rand.Reader, &rawCertA, &rawCertA, &testKey.PublicKey, &testKey)
 	certA := &core.Certificate{
 		RegistrationID: regA.ID,
-		Serial:         "001",
+		Serial:         serial1String,
 		Expires:        rawCertA.NotAfter,
 		DER:            certDerA,
 	}
 	certStatusA := &core.CertificateStatus{
-		Serial:                "001",
-		LastExpirationNagSent: ctx.fc.Now().AddDate(0, 0, -3),
+		Serial:                serial1String,
+		LastExpirationNagSent: testCtx.fc.Now().AddDate(0, 0, -3),
 		Status:                core.OCSPStatusGood,
 	}
 
@@ -212,20 +265,20 @@ func TestFindExpiringCertificates(t *testing.T) {
 		Subject: pkix.Name{
 			CommonName: "happy B",
 		},
-		NotAfter:     ctx.fc.Now().AddDate(0, 0, 3),
+		NotAfter:     testCtx.fc.Now().AddDate(0, 0, 3),
 		DNSNames:     []string{"example-b.com"},
-		SerialNumber: big.NewInt(1337),
+		SerialNumber: serial2,
 	}
 	certDerB, _ := x509.CreateCertificate(rand.Reader, &rawCertB, &rawCertB, &testKey.PublicKey, &testKey)
 	certB := &core.Certificate{
 		RegistrationID: regA.ID,
-		Serial:         "002",
+		Serial:         serial2String,
 		Expires:        rawCertB.NotAfter,
 		DER:            certDerB,
 	}
 	certStatusB := &core.CertificateStatus{
-		Serial:                "002",
-		LastExpirationNagSent: ctx.fc.Now().Add(-36 * time.Hour),
+		Serial:                serial2String,
+		LastExpirationNagSent: testCtx.fc.Now().Add(-36 * time.Hour),
 		Status:                core.OCSPStatusGood,
 	}
 
@@ -234,72 +287,254 @@ func TestFindExpiringCertificates(t *testing.T) {
 		Subject: pkix.Name{
 			CommonName: "happy C",
 		},
-		NotAfter:     ctx.fc.Now().Add((7*24 + 1) * time.Hour),
+		NotAfter:     testCtx.fc.Now().Add((7*24 + 1) * time.Hour),
 		DNSNames:     []string{"example-c.com"},
-		SerialNumber: big.NewInt(1337),
+		SerialNumber: serial3,
 	}
 	certDerC, _ := x509.CreateCertificate(rand.Reader, &rawCertC, &rawCertC, &testKey.PublicKey, &testKey)
 	certC := &core.Certificate{
 		RegistrationID: regB.ID,
-		Serial:         "003",
+		Serial:         serial3String,
 		Expires:        rawCertC.NotAfter,
 		DER:            certDerC,
 	}
 	certStatusC := &core.CertificateStatus{
-		Serial: "003",
+		Serial: serial3String,
 		Status: core.OCSPStatusGood,
 	}
 
-	setupDBMap, err := sa.NewDbMap("mysql+tcp://test_setup@localhost:3306/boulder_sa_test")
+	// Expires in 3d, renewed
+	rawCertD := x509.Certificate{
+		Subject: pkix.Name{
+			CommonName: "happy D",
+		},
+		NotAfter:     testCtx.fc.Now().AddDate(0, 0, 3),
+		DNSNames:     []string{"example-d.com"},
+		SerialNumber: serial4,
+	}
+	certDerD, _ := x509.CreateCertificate(rand.Reader, &rawCertD, &rawCertD, &testKey.PublicKey, &testKey)
+	certD := &core.Certificate{
+		RegistrationID: regC.ID,
+		Serial:         serial4String,
+		Expires:        rawCertD.NotAfter,
+		DER:            certDerD,
+	}
+	certStatusD := &core.CertificateStatus{
+		Serial: serial4String,
+		Status: core.OCSPStatusGood,
+	}
+	fqdnStatusD := &core.FQDNSet{
+		SetHash: []byte("hash of D"),
+		Serial:  serial4String,
+		Issued:  testCtx.fc.Now().AddDate(0, 0, -87),
+		Expires: testCtx.fc.Now().AddDate(0, 0, 3),
+	}
+	fqdnStatusDRenewed := &core.FQDNSet{
+		SetHash: []byte("hash of D"),
+		Serial:  serial5String,
+		Issued:  testCtx.fc.Now().AddDate(0, 0, -3),
+		Expires: testCtx.fc.Now().AddDate(0, 0, 87),
+	}
+
+	setupDBMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, 0)
 	err = setupDBMap.Insert(certA)
 	test.AssertNotError(t, err, "Couldn't add certA")
 	err = setupDBMap.Insert(certB)
 	test.AssertNotError(t, err, "Couldn't add certB")
 	err = setupDBMap.Insert(certC)
 	test.AssertNotError(t, err, "Couldn't add certC")
+	err = setupDBMap.Insert(certD)
+	test.AssertNotError(t, err, "Couldn't add certD")
 	err = setupDBMap.Insert(certStatusA)
 	test.AssertNotError(t, err, "Couldn't add certStatusA")
 	err = setupDBMap.Insert(certStatusB)
 	test.AssertNotError(t, err, "Couldn't add certStatusB")
 	err = setupDBMap.Insert(certStatusC)
 	test.AssertNotError(t, err, "Couldn't add certStatusC")
+	err = setupDBMap.Insert(certStatusD)
+	test.AssertNotError(t, err, "Couldn't add certStatusD")
+	err = setupDBMap.Insert(fqdnStatusD)
+	test.AssertNotError(t, err, "Couldn't add fqdnStatusD")
+	err = setupDBMap.Insert(fqdnStatusDRenewed)
+	test.AssertNotError(t, err, "Couldn't add fqdnStatusDRenewed")
 
 	log.Clear()
-	err = ctx.m.findExpiringCertificates()
+	err = testCtx.m.findExpiringCertificates()
 	test.AssertNotError(t, err, "Failed to find expiring certs")
 	// Should get 001 and 003
-	test.AssertEquals(t, len(ctx.mc.Messages), 2)
+	test.AssertEquals(t, len(testCtx.mc.Messages), 2)
 
-	test.AssertEquals(t, fmt.Sprintf(`hi, cert for DNS names example-a.com is going to expire in 0 days (%s)`, rawCertA.NotAfter.UTC().Format("2006-01-02 15:04:05 -0700 MST")), ctx.mc.Messages[0])
-	test.AssertEquals(t, fmt.Sprintf(`hi, cert for DNS names example-c.com is going to expire in 7 days (%s)`, rawCertC.NotAfter.UTC().Format("2006-01-02 15:04:05 -0700 MST")), ctx.mc.Messages[1])
+	test.AssertEquals(t, mocks.MailerMessage{
+		To:      emailARaw,
+		Subject: "",
+		Body:    fmt.Sprintf(`hi, cert for DNS names example-a.com is going to expire in 0 days (%s)`, rawCertA.NotAfter.UTC().Format(time.RFC822Z)),
+	}, testCtx.mc.Messages[0])
+	test.AssertEquals(t, mocks.MailerMessage{
+		To:      emailBRaw,
+		Subject: "",
+		Body:    fmt.Sprintf(`hi, cert for DNS names example-c.com is going to expire in 7 days (%s)`, rawCertC.NotAfter.UTC().Format(time.RFC822Z)),
+	}, testCtx.mc.Messages[1])
+
+	// Check that regC's only certificate being renewed does not cause a log
+	test.AssertEquals(t, len(log.GetAllMatching("no certs given to send nags for")), 0)
 
 	// A consecutive run shouldn't find anything
-	ctx.mc.Clear()
+	testCtx.mc.Clear()
 	log.Clear()
-	err = ctx.m.findExpiringCertificates()
+	err = testCtx.m.findExpiringCertificates()
 	test.AssertNotError(t, err, "Failed to find expiring certs")
-	test.AssertEquals(t, len(ctx.mc.Messages), 0)
+	test.AssertEquals(t, len(testCtx.mc.Messages), 0)
+}
+
+func TestCertIsRenewed(t *testing.T) {
+	testCtx := setup(t, []time.Duration{time.Hour * 24, time.Hour * 24 * 4, time.Hour * 24 * 7})
+
+	reg := satest.CreateWorkingRegistration(t, testCtx.ssa)
+
+	testCerts := []*struct {
+		Serial       *big.Int
+		stringSerial string
+		FQDNHash     []byte
+		DNS          string
+		NotBefore    time.Time
+		NotAfter     time.Time
+		// this field is the test assertion
+		IsRenewed bool
+	}{
+		{
+			Serial:    serial1,
+			FQDNHash:  []byte("hash of A"),
+			DNS:       "a.example.com",
+			NotBefore: testCtx.fc.Now().Add((-1 * 24) * time.Hour),
+			NotAfter:  testCtx.fc.Now().Add((89 * 24) * time.Hour),
+			IsRenewed: true,
+		},
+		{
+			Serial:    serial2,
+			FQDNHash:  []byte("hash of A"),
+			DNS:       "a.example.com",
+			NotBefore: testCtx.fc.Now().Add((0 * 24) * time.Hour),
+			NotAfter:  testCtx.fc.Now().Add((90 * 24) * time.Hour),
+			IsRenewed: false,
+		},
+		{
+			Serial:    serial3,
+			FQDNHash:  []byte("hash of B"),
+			DNS:       "b.example.net",
+			NotBefore: testCtx.fc.Now().Add((0 * 24) * time.Hour),
+			NotAfter:  testCtx.fc.Now().Add((90 * 24) * time.Hour),
+			IsRenewed: false,
+		},
+		{
+			Serial:    serial4,
+			FQDNHash:  []byte("hash of C"),
+			DNS:       "c.example.org",
+			NotBefore: testCtx.fc.Now().Add((-100 * 24) * time.Hour),
+			NotAfter:  testCtx.fc.Now().Add((-10 * 24) * time.Hour),
+			IsRenewed: true,
+		},
+		{
+			Serial:    serial5,
+			FQDNHash:  []byte("hash of C"),
+			DNS:       "c.example.org",
+			NotBefore: testCtx.fc.Now().Add((-80 * 24) * time.Hour),
+			NotAfter:  testCtx.fc.Now().Add((10 * 24) * time.Hour),
+			IsRenewed: true,
+		},
+		{
+			Serial:    serial6,
+			FQDNHash:  []byte("hash of C"),
+			DNS:       "c.example.org",
+			NotBefore: testCtx.fc.Now().Add((-75 * 24) * time.Hour),
+			NotAfter:  testCtx.fc.Now().Add((15 * 24) * time.Hour),
+			IsRenewed: true,
+		},
+		{
+			Serial:    serial7,
+			FQDNHash:  []byte("hash of C"),
+			DNS:       "c.example.org",
+			NotBefore: testCtx.fc.Now().Add((-1 * 24) * time.Hour),
+			NotAfter:  testCtx.fc.Now().Add((89 * 24) * time.Hour),
+			IsRenewed: false,
+		},
+	}
+
+	setupDBMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, testData := range testCerts {
+		testData.stringSerial = core.SerialToString(testData.Serial)
+
+		rawCert := x509.Certificate{
+			Subject: pkix.Name{
+				CommonName: testData.DNS,
+			},
+			NotBefore:    testData.NotBefore,
+			NotAfter:     testData.NotAfter,
+			DNSNames:     []string{testData.DNS},
+			SerialNumber: testData.Serial,
+		}
+		certDer, err := x509.CreateCertificate(rand.Reader, &rawCert, &rawCert, &testKey.PublicKey, &testKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cert := &core.Certificate{
+			RegistrationID: reg.ID,
+			Serial:         testData.stringSerial,
+			Issued:         testData.NotBefore,
+			Expires:        testData.NotAfter,
+			DER:            certDer,
+		}
+		certStatus := &core.CertificateStatus{
+			Serial: testData.stringSerial,
+			Status: core.OCSPStatusGood,
+		}
+		fqdnStatus := &core.FQDNSet{
+			SetHash: testData.FQDNHash,
+			Serial:  testData.stringSerial,
+			Issued:  testData.NotBefore,
+			Expires: testData.NotAfter,
+		}
+
+		err = setupDBMap.Insert(cert)
+		test.AssertNotError(t, err, fmt.Sprintf("Couldn't add cert %s", testData.stringSerial))
+		err = setupDBMap.Insert(certStatus)
+		test.AssertNotError(t, err, fmt.Sprintf("Couldn't add certStatus %s", testData.stringSerial))
+		err = setupDBMap.Insert(fqdnStatus)
+		test.AssertNotError(t, err, fmt.Sprintf("Couldn't add fqdnStatus %s", testData.stringSerial))
+	}
+
+	for _, testData := range testCerts {
+		renewed, err := testCtx.m.certIsRenewed(testData.stringSerial)
+		if err != nil {
+			t.Errorf("error checking renewal state for %s: %v", testData.stringSerial, err)
+			continue
+		}
+		if renewed != testData.IsRenewed {
+			t.Errorf("for %s: got %v, expected %v", testData.stringSerial, renewed, testData.IsRenewed)
+		}
+	}
 }
 
 func TestLifetimeOfACert(t *testing.T) {
-	ctx := setup(t, []time.Duration{time.Hour * 24, time.Hour * 24 * 4, time.Hour * 24 * 7})
-	defer ctx.cleanUp()
+	testCtx := setup(t, []time.Duration{time.Hour * 24, time.Hour * 24 * 4, time.Hour * 24 * 7})
+	defer testCtx.cleanUp()
 
 	var keyA jose.JsonWebKey
 	err := json.Unmarshal(jsonKeyA, &keyA)
 	test.AssertNotError(t, err, "Failed to unmarshal public JWK")
 
-	emailA, _ := core.ParseAcmeURL("mailto:one@mail.com")
-
 	regA := core.Registration{
 		ID: 1,
-		Contact: []*core.AcmeURL{
+		Contact: &[]*core.AcmeURL{
 			emailA,
 		},
 		Key:       keyA,
 		InitialIP: net.ParseIP("1.2.2.1"),
 	}
-	regA, err = ctx.ssa.NewRegistration(regA)
+	regA, err = testCtx.ssa.NewRegistration(ctx, regA)
 	if err != nil {
 		t.Fatalf("Couldn't store regA: %s", err)
 	}
@@ -308,24 +543,24 @@ func TestLifetimeOfACert(t *testing.T) {
 			CommonName: "happy A",
 		},
 
-		NotAfter:     ctx.fc.Now(),
+		NotAfter:     testCtx.fc.Now(),
 		DNSNames:     []string{"example-a.com"},
-		SerialNumber: big.NewInt(1337),
+		SerialNumber: serial1,
 	}
 	certDerA, _ := x509.CreateCertificate(rand.Reader, &rawCertA, &rawCertA, &testKey.PublicKey, &testKey)
 	certA := &core.Certificate{
 		RegistrationID: regA.ID,
-		Serial:         "001",
+		Serial:         serial1String,
 		Expires:        rawCertA.NotAfter,
 		DER:            certDerA,
 	}
 
 	certStatusA := &core.CertificateStatus{
-		Serial: "001",
+		Serial: serial1String,
 		Status: core.OCSPStatusGood,
 	}
 
-	setupDBMap, err := sa.NewDbMap("mysql+tcp://test_setup@localhost:3306/boulder_sa_test")
+	setupDBMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, 0)
 	err = setupDBMap.Insert(certA)
 	test.AssertNotError(t, err, "unable to insert Certificate")
 	err = setupDBMap.Insert(certStatusA)
@@ -376,19 +611,19 @@ func TestLifetimeOfACert(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		ctx.fc.Add(-tt.timeLeft)
-		err = ctx.m.findExpiringCertificates()
+		testCtx.fc.Add(-tt.timeLeft)
+		err = testCtx.m.findExpiringCertificates()
 		test.AssertNotError(t, err, "error calling findExpiringCertificates")
-		if len(ctx.mc.Messages) != tt.numMsgs {
-			t.Errorf(tt.context+" number of messages: expected %d, got %d", tt.numMsgs, len(ctx.mc.Messages))
+		if len(testCtx.mc.Messages) != tt.numMsgs {
+			t.Errorf(tt.context+" number of messages: expected %d, got %d", tt.numMsgs, len(testCtx.mc.Messages))
 		}
-		ctx.fc.Add(tt.timeLeft)
+		testCtx.fc.Add(tt.timeLeft)
 	}
 }
 
 func TestDontFindRevokedCert(t *testing.T) {
 	expiresIn := 24 * time.Hour
-	ctx := setup(t, []time.Duration{expiresIn})
+	testCtx := setup(t, []time.Duration{expiresIn})
 
 	var keyA jose.JsonWebKey
 	err := json.Unmarshal(jsonKeyA, &keyA)
@@ -398,13 +633,13 @@ func TestDontFindRevokedCert(t *testing.T) {
 
 	regA := core.Registration{
 		ID: 1,
-		Contact: []*core.AcmeURL{
+		Contact: &[]*core.AcmeURL{
 			emailA,
 		},
 		Key:       keyA,
 		InitialIP: net.ParseIP("6.5.5.6"),
 	}
-	regA, err = ctx.ssa.NewRegistration(regA)
+	regA, err = testCtx.ssa.NewRegistration(ctx, regA)
 	if err != nil {
 		t.Fatalf("Couldn't store regA: %s", err)
 	}
@@ -413,35 +648,121 @@ func TestDontFindRevokedCert(t *testing.T) {
 			CommonName: "happy A",
 		},
 
-		NotAfter:     ctx.fc.Now().Add(expiresIn),
+		NotAfter:     testCtx.fc.Now().Add(expiresIn),
 		DNSNames:     []string{"example-a.com"},
-		SerialNumber: big.NewInt(1337),
+		SerialNumber: serial1,
 	}
 	certDerA, _ := x509.CreateCertificate(rand.Reader, &rawCertA, &rawCertA, &testKey.PublicKey, &testKey)
 	certA := &core.Certificate{
 		RegistrationID: regA.ID,
-		Serial:         "001",
+		Serial:         serial1String,
 		Expires:        rawCertA.NotAfter,
 		DER:            certDerA,
 	}
 
 	certStatusA := &core.CertificateStatus{
-		Serial: "001",
+		Serial: serial1String,
 		Status: core.OCSPStatusRevoked,
 	}
 
-	setupDBMap, err := sa.NewDbMap("mysql+tcp://test_setup@localhost:3306/boulder_sa_test")
+	setupDBMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, 0)
 	err = setupDBMap.Insert(certA)
 	test.AssertNotError(t, err, "unable to insert Certificate")
 	err = setupDBMap.Insert(certStatusA)
 	test.AssertNotError(t, err, "unable to insert CertificateStatus")
 
-	err = ctx.m.findExpiringCertificates()
+	err = testCtx.m.findExpiringCertificates()
 	test.AssertNotError(t, err, "err from findExpiringCertificates")
 
-	if len(ctx.mc.Messages) != 0 {
-		t.Errorf("no emails should have been sent, but sent %d", len(ctx.mc.Messages))
+	if len(testCtx.mc.Messages) != 0 {
+		t.Errorf("no emails should have been sent, but sent %d", len(testCtx.mc.Messages))
 	}
+}
+
+func TestDedupOnRegistration(t *testing.T) {
+	expiresIn := 96 * time.Hour
+	testCtx := setup(t, []time.Duration{expiresIn})
+
+	var keyA jose.JsonWebKey
+	err := json.Unmarshal(jsonKeyA, &keyA)
+	test.AssertNotError(t, err, "Failed to unmarshal public JWK")
+
+	regA := core.Registration{
+		ID: 1,
+		Contact: &[]*core.AcmeURL{
+			emailA,
+		},
+		Key:       keyA,
+		InitialIP: net.ParseIP("6.5.5.6"),
+	}
+	regA, err = testCtx.ssa.NewRegistration(ctx, regA)
+	if err != nil {
+		t.Fatalf("Couldn't store regA: %s", err)
+	}
+	rawCertA := newX509Cert("happy A",
+		testCtx.fc.Now().Add(72*time.Hour),
+		[]string{"example-a.com", "shared-example.com"},
+		serial1,
+	)
+
+	certDerA, _ := x509.CreateCertificate(rand.Reader, rawCertA, rawCertA, &testKey.PublicKey, &testKey)
+	certA := &core.Certificate{
+		RegistrationID: regA.ID,
+		Serial:         serial1String,
+		Expires:        rawCertA.NotAfter,
+		DER:            certDerA,
+	}
+	certStatusA := &core.CertificateStatus{
+		Serial:                serial1String,
+		LastExpirationNagSent: time.Unix(0, 0),
+		Status:                core.OCSPStatusGood,
+	}
+
+	rawCertB := newX509Cert("happy B",
+		testCtx.fc.Now().Add(48*time.Hour),
+		[]string{"example-b.com", "shared-example.com"},
+		serial2,
+	)
+	certDerB, _ := x509.CreateCertificate(rand.Reader, rawCertB, rawCertB, &testKey.PublicKey, &testKey)
+	certB := &core.Certificate{
+		RegistrationID: regA.ID,
+		Serial:         serial2String,
+		Expires:        rawCertB.NotAfter,
+		DER:            certDerB,
+	}
+	certStatusB := &core.CertificateStatus{
+		Serial:                serial2String,
+		LastExpirationNagSent: time.Unix(0, 0),
+		Status:                core.OCSPStatusGood,
+	}
+
+	setupDBMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, 0)
+	err = setupDBMap.Insert(certA)
+	test.AssertNotError(t, err, "Couldn't add certA")
+	err = setupDBMap.Insert(certB)
+	test.AssertNotError(t, err, "Couldn't add certB")
+	err = setupDBMap.Insert(certStatusA)
+	test.AssertNotError(t, err, "Couldn't add certStatusA")
+	err = setupDBMap.Insert(certStatusB)
+	test.AssertNotError(t, err, "Couldn't add certStatusB")
+
+	err = testCtx.m.findExpiringCertificates()
+	test.AssertNotError(t, err, "error calling findExpiringCertificates")
+	if len(testCtx.mc.Messages) > 1 {
+		t.Errorf("num of messages, want %d, got %d", 1, len(testCtx.mc.Messages))
+	}
+	if len(testCtx.mc.Messages) == 0 {
+		t.Fatalf("no messages sent")
+	}
+	domains := "example-a.com\nexample-b.com\nshared-example.com"
+	expected := mocks.MailerMessage{
+		To:      emailARaw,
+		Subject: "",
+		Body: fmt.Sprintf(`hi, cert for DNS names %s is going to expire in 1 days (%s)`,
+			domains,
+			rawCertB.NotAfter.Format(time.RFC822Z)),
+	}
+	test.AssertEquals(t, expected, testCtx.mc.Messages[0])
 }
 
 type testCtx struct {
@@ -456,12 +777,12 @@ type testCtx struct {
 func setup(t *testing.T, nagTimes []time.Duration) *testCtx {
 	// We use the test_setup user (which has full permissions to everything)
 	// because the SA we return is used for inserting data to set up the test.
-	dbMap, err := sa.NewDbMap(vars.DBConnSAFullPerms)
+	dbMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, 0)
 	if err != nil {
 		t.Fatalf("Couldn't connect the database: %s", err)
 	}
 	fc := newFakeClock(t)
-	ssa, err := sa.NewSQLStorageAuthority(dbMap, fc)
+	ssa, err := sa.NewSQLStorageAuthority(dbMap, fc, log)
 	if err != nil {
 		t.Fatalf("unable to create SQLStorageAuthority: %s", err)
 	}
@@ -476,7 +797,7 @@ func setup(t *testing.T, nagTimes []time.Duration) *testCtx {
 	}
 
 	m := &mailer{
-		log:           blog.GetAuditLogger(),
+		log:           log,
 		stats:         stats,
 		mailer:        mc,
 		emailTemplate: tmpl,

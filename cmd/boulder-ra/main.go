@@ -1,90 +1,168 @@
-// Copyright 2014 ISRG.  All rights reserved
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
-
 package main
 
 import (
+	"flag"
+	"fmt"
+	"os"
 	"time"
 
-	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/cactus/go-statsd-client/statsd"
-	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/jmhodges/clock"
+	"github.com/jmhodges/clock"
+
 	"github.com/letsencrypt/boulder/bdns"
+	"github.com/letsencrypt/boulder/cmd"
+	"github.com/letsencrypt/boulder/core"
+	bgrpc "github.com/letsencrypt/boulder/grpc"
 	"github.com/letsencrypt/boulder/metrics"
 	"github.com/letsencrypt/boulder/policy"
-	"github.com/letsencrypt/boulder/sa"
-
-	"github.com/letsencrypt/boulder/cmd"
-	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/ra"
 	"github.com/letsencrypt/boulder/rpc"
 )
 
 const clientName = "RA"
 
-func main() {
-	app := cmd.NewAppShell("boulder-ra", "Handles service orchestration")
-	app.Action = func(c cmd.Config, stats statsd.Statter, auditlogger *blog.AuditLogger) {
-		// Validate PA config and set defaults if needed
-		cmd.FailOnError(c.PA.CheckChallenges(), "Invalid PA configuration")
+type config struct {
+	RA struct {
+		cmd.ServiceConfig
+		cmd.HostnamePolicyConfig
 
-		go cmd.DebugServer(c.RA.DebugAddr)
+		RateLimitPoliciesFilename string
 
-		dbURL, err := c.PA.DBConfig.URL()
-		cmd.FailOnError(err, "Couldn't load DB URL")
-		paDbMap, err := sa.NewDbMap(dbURL)
-		cmd.FailOnError(err, "Couldn't connect to policy database")
-		pa, err := policy.NewPolicyAuthorityImpl(paDbMap, c.PA.EnforcePolicyWhitelist, c.PA.Challenges)
-		cmd.FailOnError(err, "Couldn't create PA")
+		MaxConcurrentRPCServerRequests int64
 
-		rateLimitPolicies, err := cmd.LoadRateLimitPolicies(c.RA.RateLimitPoliciesFilename)
-		cmd.FailOnError(err, "Couldn't load rate limit policies file")
+		MaxContactsPerRegistration int
 
-		go cmd.ProfileCmd("RA", stats)
+		// UseIsSafeDomain determines whether to call VA.IsSafeDomain
+		UseIsSafeDomain bool // TODO: remove after va IsSafeDomain deploy
 
-		amqpConf := c.RA.AMQP
-		vac, err := rpc.NewValidationAuthorityClient(clientName, amqpConf, stats)
-		cmd.FailOnError(err, "Unable to create VA client")
+		// The number of times to try a DNS query (that has a temporary error)
+		// before giving up. May be short-circuited by deadlines. A zero value
+		// will be turned into 1.
+		DNSTries int
 
-		cac, err := rpc.NewCertificateAuthorityClient(clientName, amqpConf, stats)
-		cmd.FailOnError(err, "Unable to create CA client")
+		VAService *cmd.GRPCClientConfig
 
-		sac, err := rpc.NewStorageAuthorityClient(clientName, amqpConf, stats)
-		cmd.FailOnError(err, "Unable to create SA client")
+		MaxNames     int
+		DoNotForceCN bool
 
-		var dc *ra.DomainCheck
-		if c.RA.UseIsSafeDomain {
-			dc = &ra.DomainCheck{VA: vac}
-		}
-
-		rai := ra.NewRegistrationAuthorityImpl(clock.Default(), auditlogger, stats,
-			dc, rateLimitPolicies, c.RA.MaxContactsPerRegistration, c.KeyPolicy())
-		rai.PA = pa
-		raDNSTimeout, err := time.ParseDuration(c.Common.DNSTimeout)
-		cmd.FailOnError(err, "Couldn't parse RA DNS timeout")
-		scoped := metrics.NewStatsdScope(stats, "RA", "DNS")
-		dnsTries := c.RA.DNSTries
-		if dnsTries < 1 {
-			dnsTries = 1
-		}
-		if !c.Common.DNSAllowLoopbackAddresses {
-			rai.DNSResolver = bdns.NewDNSResolverImpl(raDNSTimeout, []string{c.Common.DNSResolver}, scoped, clock.Default(), dnsTries)
-		} else {
-			rai.DNSResolver = bdns.NewTestDNSResolverImpl(raDNSTimeout, []string{c.Common.DNSResolver}, scoped, clock.Default(), dnsTries)
-		}
-
-		rai.VA = vac
-		rai.CA = cac
-		rai.SA = sac
-
-		ras, err := rpc.NewAmqpRPCServer(amqpConf, c.RA.MaxConcurrentRPCServerRequests, stats)
-		cmd.FailOnError(err, "Unable to create RA RPC server")
-		rpc.NewRegistrationAuthorityServer(ras, rai)
-
-		err = ras.Start(amqpConf)
-		cmd.FailOnError(err, "Unable to run RA RPC server")
+		// Controls behaviour of the RA when asked to create a new authz for
+		// a name/regID that already has a valid authz. False preserves historic
+		// behaviour and ignores the existing authz and creates a new one. True
+		// instructs the RA to reuse the previously created authz in lieu of
+		// creating another.
+		ReuseValidAuthz bool
 	}
 
-	app.Run()
+	*cmd.AllowedSigningAlgos
+
+	PA cmd.PAConfig
+
+	cmd.StatsdConfig
+
+	cmd.SyslogConfig
+
+	Common struct {
+		DNSResolver               string
+		DNSTimeout                string
+		DNSAllowLoopbackAddresses bool
+	}
+}
+
+func main() {
+	configFile := flag.String("config", "", "File path to the configuration file for this service")
+	flag.Parse()
+	if *configFile == "" {
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	var c config
+	err := cmd.ReadJSONFile(*configFile, &c)
+	cmd.FailOnError(err, "Reading JSON config file into config structure")
+
+	go cmd.DebugServer(c.RA.DebugAddr)
+
+	stats, logger := cmd.StatsAndLogging(c.StatsdConfig, c.SyslogConfig)
+	defer logger.AuditPanic()
+	logger.Info(cmd.VersionString(clientName))
+
+	// Validate PA config and set defaults if needed
+	cmd.FailOnError(c.PA.CheckChallenges(), "Invalid PA configuration")
+
+	pa, err := policy.New(c.PA.Challenges)
+	cmd.FailOnError(err, "Couldn't create PA")
+
+	if c.RA.HostnamePolicyFile == "" {
+		cmd.FailOnError(fmt.Errorf("HostnamePolicyFile must be provided."), "")
+	}
+	err = pa.SetHostnamePolicyFile(c.RA.HostnamePolicyFile)
+	cmd.FailOnError(err, "Couldn't load hostname policy file")
+
+	go cmd.ProfileCmd("RA", stats)
+
+	amqpConf := c.RA.AMQP
+	var vac core.ValidationAuthority
+	if c.RA.VAService != nil {
+		conn, err := bgrpc.ClientSetup(c.RA.VAService)
+		cmd.FailOnError(err, "Unable to create VA client")
+		vac = bgrpc.NewValidationAuthorityGRPCClient(conn)
+	} else {
+		vac, err = rpc.NewValidationAuthorityClient(clientName, amqpConf, stats)
+		cmd.FailOnError(err, "Unable to create VA client")
+	}
+
+	cac, err := rpc.NewCertificateAuthorityClient(clientName, amqpConf, stats)
+	cmd.FailOnError(err, "Unable to create CA client")
+
+	sac, err := rpc.NewStorageAuthorityClient(clientName, amqpConf, stats)
+	cmd.FailOnError(err, "Unable to create SA client")
+
+	rai := ra.NewRegistrationAuthorityImpl(
+		clock.Default(),
+		logger,
+		stats,
+		c.RA.MaxContactsPerRegistration,
+		c.AllowedSigningAlgos.KeyPolicy(),
+		c.RA.MaxNames,
+		c.RA.DoNotForceCN,
+		c.RA.ReuseValidAuthz)
+
+	policyErr := rai.SetRateLimitPoliciesFile(c.RA.RateLimitPoliciesFilename)
+	cmd.FailOnError(policyErr, "Couldn't load rate limit policies file")
+	rai.PA = pa
+
+	raDNSTimeout, err := time.ParseDuration(c.Common.DNSTimeout)
+	cmd.FailOnError(err, "Couldn't parse RA DNS timeout")
+	scoped := metrics.NewStatsdScope(stats, "RA", "DNS")
+	dnsTries := c.RA.DNSTries
+	if dnsTries < 1 {
+		dnsTries = 1
+	}
+	if !c.Common.DNSAllowLoopbackAddresses {
+		rai.DNSResolver = bdns.NewDNSResolverImpl(
+			raDNSTimeout,
+			[]string{c.Common.DNSResolver},
+			nil,
+			scoped,
+			clock.Default(),
+			dnsTries)
+	} else {
+		rai.DNSResolver = bdns.NewTestDNSResolverImpl(
+			raDNSTimeout,
+			[]string{c.Common.DNSResolver},
+			scoped,
+			clock.Default(),
+			dnsTries)
+	}
+
+	rai.VA = vac
+	rai.CA = cac
+	rai.SA = sac
+
+	ras, err := rpc.NewAmqpRPCServer(amqpConf, c.RA.MaxConcurrentRPCServerRequests, stats, logger)
+	cmd.FailOnError(err, "Unable to create RA RPC server")
+	err = rpc.NewRegistrationAuthorityServer(ras, rai, logger)
+	cmd.FailOnError(err, "Unable to setup RA RPC server")
+
+	err = ras.Start(amqpConf)
+	cmd.FailOnError(err, "Unable to run RA RPC server")
 }

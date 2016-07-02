@@ -1,8 +1,3 @@
-// Copyright 2014 ISRG.  All rights reserved
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
-
 // This package provides utilities that underlie the specific commands.
 // The idea is to make the specific command files very small, e.g.:
 //
@@ -38,17 +33,19 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/cactus/go-statsd-client/statsd"
-	cfsslLog "github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/cloudflare/cfssl/log"
-	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/codegangsta/cli"
+	"github.com/go-sql-driver/mysql"
+
+	cfsslLog "github.com/cloudflare/cfssl/log"
+	"github.com/codegangsta/cli"
 
 	"github.com/letsencrypt/boulder/core"
 	blog "github.com/letsencrypt/boulder/log"
+	"github.com/letsencrypt/boulder/metrics"
 )
 
 // AppShell contains CLI Metadata
 type AppShell struct {
-	Action func(Config, statsd.Statter, *blog.AuditLogger)
+	Action func(Config, metrics.Statter, blog.Logger)
 	Config func(*cli.Context, Config) Config
 	App    *cli.App
 }
@@ -97,36 +94,6 @@ func (as *AppShell) Run() {
 		}
 
 		// Provide default values for each service's AMQP config section.
-		if config.ActivityMonitor.AMQP == nil {
-			config.ActivityMonitor.AMQP = config.AMQP
-		}
-		if config.WFE.AMQP == nil {
-			config.WFE.AMQP = config.AMQP
-		}
-		if config.CA.AMQP == nil {
-			config.CA.AMQP = config.AMQP
-			if config.CA.AMQP != nil && config.AMQP.CA != nil {
-				config.CA.AMQP.ServiceQueue = config.AMQP.CA.Server
-			}
-		}
-		if config.RA.AMQP == nil {
-			config.RA.AMQP = config.AMQP
-			if config.RA.AMQP != nil && config.AMQP.RA != nil {
-				config.RA.AMQP.ServiceQueue = config.AMQP.RA.Server
-			}
-		}
-		if config.SA.AMQP == nil {
-			config.SA.AMQP = config.AMQP
-			if config.SA.AMQP != nil && config.AMQP.SA != nil {
-				config.SA.AMQP.ServiceQueue = config.AMQP.SA.Server
-			}
-		}
-		if config.VA.AMQP == nil {
-			config.VA.AMQP = config.AMQP
-			if config.VA.AMQP != nil && config.AMQP.VA != nil {
-				config.VA.AMQP.ServiceQueue = config.AMQP.VA.Server
-			}
-		}
 		if config.Mailer.AMQP == nil {
 			config.Mailer.AMQP = config.AMQP
 		}
@@ -143,47 +110,69 @@ func (as *AppShell) Run() {
 			}
 		}
 
-		stats, auditlogger := StatsAndLogging(config.Statsd, config.Syslog)
-		auditlogger.Info(as.VersionString())
+		stats, logger := StatsAndLogging(config.Statsd, config.Syslog)
+		logger.Info(as.VersionString())
 
 		// If as.Action generates a panic, this will log it to syslog.
 		// AUDIT[ Error Conditions ] 9cc4d537-8534-4970-8665-4b382abe82f3
-		defer auditlogger.AuditPanic()
+		defer logger.AuditPanic()
 
-		as.Action(config, stats, auditlogger)
+		as.Action(config, stats, logger)
 	}
 
 	err := as.App.Run(os.Args)
 	FailOnError(err, "Failed to run application")
 }
 
+// mysqlLogger proxies blog.AuditLogger to provide a Print(...) method.
+type mysqlLogger struct {
+	blog.Logger
+}
+
+func (m mysqlLogger) Print(v ...interface{}) {
+	m.AuditErr(fmt.Sprintf("[mysql] %s", fmt.Sprint(v...)))
+}
+
+// cfsslLogger provides two additional methods that are expected by CFSSL's
+// logger but not supported by Boulder's Logger.
+type cfsslLogger struct {
+	blog.Logger
+}
+
+func (cl cfsslLogger) Crit(msg string) {
+	cl.AuditErr(msg)
+}
+
+func (cl cfsslLogger) Emerg(msg string) {
+	cl.AuditErr(msg)
+}
+
 // StatsAndLogging constructs a Statter and an AuditLogger based on its config
 // parameters, and return them both. Crashes if any setup fails.
 // Also sets the constructed AuditLogger as the default logger.
-func StatsAndLogging(statConf StatsdConfig, logConf SyslogConfig) (statsd.Statter, *blog.AuditLogger) {
-	stats, err := statsd.NewClient(statConf.Server, statConf.Prefix)
+func StatsAndLogging(statConf StatsdConfig, logConf SyslogConfig) (metrics.Statter, blog.Logger) {
+	stats, err := metrics.NewStatter(statConf.Server, statConf.Prefix)
 	FailOnError(err, "Couldn't connect to statsd")
 
 	tag := path.Base(os.Args[0])
 	syslogger, err := syslog.Dial(
-		logConf.Network,
-		logConf.Server,
-		syslog.LOG_INFO|syslog.LOG_LOCAL0, // default, overridden by log calls
+		"",
+		"",
+		syslog.LOG_INFO, // default, not actually used
 		tag)
 	FailOnError(err, "Could not connect to Syslog")
-	level := int(syslog.LOG_DEBUG)
-	if logConf.StdoutLevel != nil {
-		level = *logConf.StdoutLevel
+	syslogLevel := int(syslog.LOG_INFO)
+	if logConf.SyslogLevel != 0 {
+		syslogLevel = logConf.SyslogLevel
 	}
-	auditlogger, err := blog.NewAuditLogger(syslogger, stats, level)
+	logger, err := blog.New(syslogger, logConf.StdoutLevel, syslogLevel)
 	FailOnError(err, "Could not connect to Syslog")
-	// TODO(https://github.com/cloudflare/cfssl/issues/426):
-	// CFSSL's log facility always prints to stdout. Ideally we should send a
-	// patch that would allow us to have CFSSL use our log facility. In the
-	// meantime, inhibit debug and info-level logs from CFSSL.
-	cfsslLog.Level = cfsslLog.LevelWarning
-	blog.SetAuditLogger(auditlogger)
-	return stats, auditlogger
+
+	_ = blog.Set(logger)
+	cfsslLog.SetLogger(cfsslLogger{logger})
+	_ = mysql.SetLogger(mysqlLogger{logger})
+
+	return stats, logger
 }
 
 // VersionString produces a friendly Application version string
@@ -195,15 +184,15 @@ func (as *AppShell) VersionString() string {
 func FailOnError(err error, msg string) {
 	if err != nil {
 		// AUDIT[ Error Conditions ] 9cc4d537-8534-4970-8665-4b382abe82f3
-		logger := blog.GetAuditLogger()
-		logger.Err(fmt.Sprintf("%s: %s", msg, err))
+		logger := blog.Get()
+		logger.AuditErr(fmt.Sprintf("%s: %s", msg, err))
 		fmt.Fprintf(os.Stderr, "%s: %s\n", msg, err)
 		os.Exit(1)
 	}
 }
 
 // ProfileCmd runs forever, sending Go runtime statistics to StatsD.
-func ProfileCmd(profileName string, stats statsd.Statter) {
+func ProfileCmd(profileName string, stats metrics.Statter) {
 	var memoryStats runtime.MemStats
 	prevNumGC := int64(0)
 	c := time.Tick(1 * time.Second)
@@ -281,5 +270,29 @@ func DebugServer(addr string) {
 	if err != nil {
 		log.Fatalf("unable to boot debug server on %#v", addr)
 	}
-	http.Serve(ln, nil)
+	err = http.Serve(ln, nil)
+	if err != nil {
+		log.Fatalf("unable to boot debug server: %v", err)
+	}
+}
+
+// ReadJSONFile takes a file path as an argument and attempts to
+// unmarshal the content of the file into a struct containing a
+// configuration of a boulder component.
+func ReadJSONFile(filename string, out interface{}) error {
+	configData, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return err
+	}
+	err = json.Unmarshal(configData, out)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// VersionString produces a friendly Application version string. Duplicated
+// from cmd.AppShell, with the exception that it takes a name as an argument.
+func VersionString(name string) string {
+	return fmt.Sprintf("Versions: %s=(%s %s) Golang=(%s) BuildHost=(%s)", name, core.GetBuildID(), core.GetBuildTime(), runtime.Version(), core.GetBuildHost())
 }

@@ -1,38 +1,44 @@
 package wfe
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"time"
 
-	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/jmhodges/clock"
+	"golang.org/x/net/context"
+
+	"github.com/jmhodges/clock"
 	"github.com/letsencrypt/boulder/core"
 	blog "github.com/letsencrypt/boulder/log"
 )
 
 type requestEvent struct {
-	ID           string    `json:",omitempty"`
-	RealIP       string    `json:",omitempty"`
-	ClientAddr   string    `json:",omitempty"`
-	Endpoint     string    `json:",omitempty"`
-	Method       string    `json:",omitempty"`
-	RequestTime  time.Time `json:",omitempty"`
-	ResponseTime time.Time `json:",omitempty"`
-	Errors       []string
-	Requester    int64           `json:",omitempty"`
-	Contacts     []*core.AcmeURL `json:",omitempty"`
-
-	Extra map[string]interface{} `json:",omitempty"`
+	ID            string    `json:",omitempty"`
+	RealIP        string    `json:",omitempty"`
+	ClientAddr    string    `json:",omitempty"`
+	Endpoint      string    `json:",omitempty"`
+	Method        string    `json:",omitempty"`
+	RequestTime   time.Time `json:",omitempty"`
+	ResponseTime  time.Time `json:",omitempty"`
+	Errors        []string
+	Requester     int64                  `json:",omitempty"`
+	Contacts      *[]*core.AcmeURL       `json:",omitempty"`
+	RequestNonce  string                 `json:",omitempty"`
+	ResponseNonce string                 `json:",omitempty"`
+	UserAgent     string                 `json:",omitempty"`
+	Extra         map[string]interface{} `json:",omitempty"`
 }
 
 func (e *requestEvent) AddError(msg string, args ...interface{}) {
 	e.Errors = append(e.Errors, fmt.Sprintf(msg, args...))
 }
 
-type wfeHandlerFunc func(*requestEvent, http.ResponseWriter, *http.Request)
+type wfeHandlerFunc func(context.Context, *requestEvent, http.ResponseWriter, *http.Request)
 
 func (f wfeHandlerFunc) ServeHTTP(e *requestEvent, w http.ResponseWriter, r *http.Request) {
-	f(e, w, r)
+	ctx := context.TODO()
+	f(ctx, e, w, r)
 }
 
 type wfeHandler interface {
@@ -41,7 +47,7 @@ type wfeHandler interface {
 
 type topHandler struct {
 	wfe wfeHandler
-	log *blog.AuditLogger
+	log blog.Logger
 	clk clock.Clock
 }
 
@@ -52,8 +58,10 @@ func (th *topHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ClientAddr:  getClientAddr(r),
 		Method:      r.Method,
 		RequestTime: time.Now(),
+		UserAgent:   r.Header.Get("User-Agent"),
 		Extra:       make(map[string]interface{}, 0),
 	}
+	w.Header().Set("Boulder-Request-ID", logEvent.ID)
 	if r.URL != nil {
 		logEvent.Endpoint = r.URL.String()
 	}
@@ -70,7 +78,12 @@ func (th *topHandler) logEvent(logEvent *requestEvent) {
 	} else {
 		msg = "Successful request"
 	}
-	th.log.InfoObject(msg, logEvent)
+	jsonEvent, err := json.Marshal(logEvent)
+	if err != nil {
+		th.log.AuditErr(fmt.Sprintf("%s - failed to marshal logEvent - %s", msg, err))
+		return
+	}
+	th.log.Info(fmt.Sprintf("%s JSON=%s", msg, jsonEvent))
 }
 
 // Comma-separated list of HTTP clients involved in making this

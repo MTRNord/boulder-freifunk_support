@@ -11,26 +11,27 @@ import tempfile
 import threading
 import time
 
-
-class ToSServerThread(threading.Thread):
-    class ToSHandler(BaseHTTPServer.BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write("Do What Ye Will (An it Harm None).\n")
-    def run(self):
-        try:
-            BaseHTTPServer.HTTPServer(("localhost", 4001), self.ToSHandler).serve_forever()
-        except Exception as e:
-            print "Problem starting ToSServer: %s" % e
-            sys.exit(1)
-
-
-default_config = os.environ.get('BOULDER_CONFIG')
-if default_config is None:
+# TODO: remove default_config once all binaries have been migrated from the global config
+default_config = os.environ.get('BOULDER_CONFIG', '')
+if default_config == '':
     default_config = 'test/boulder-config.json'
+
+default_config_dir = os.environ.get('BOULDER_CONFIG_DIR', '')
+if default_config_dir == '':
+    default_config_dir = 'test/config'
+
 processes = []
 
+def get_config(service):
+    """
+    Returns the path to the configuration file for a service, if it does not
+    exist, it return a path to the default config files, which will
+    eventually be removed completely
+    """
+    path = os.path.join(default_config_dir, service + ".json")
+    if os.path.exists(path):
+        return path
+    return default_config
 
 def install(race_detection):
     # Pass empty BUILD_TIME and BUILD_ID flags to avoid constantly invalidating the
@@ -38,16 +39,15 @@ def install(race_detection):
     # BUILD_ID.
     cmd = "make GO_BUILD_FLAGS=''  "
     if race_detection:
-        cmd = "make GO_BUILD_FLAGS=-race"
+        cmd = "make GO_BUILD_FLAGS='-race -tags \"integration\"'"
 
     return subprocess.call(cmd, shell=True) == 0
 
-def run(binary, race_detection, config=default_config):
+def run(cmd, race_detection):
     # Note: Must use exec here so that killing this process kills the command.
-    cmd = """GORACE="halt_on_error=1" exec ./bin/%s --config %s""" % (binary, config)
+    cmd = """GORACE="halt_on_error=1" exec ./bin/%s""" % cmd
     p = subprocess.Popen(cmd, shell=True)
     p.cmd = cmd
-    print('started %s with pid %d' % (p.cmd, p.pid))
     return p
 
 def start(race_detection):
@@ -59,20 +59,20 @@ def start(race_detection):
     """
     global processes
     forward()
-    t = ToSServerThread()
-    t.daemon = True
-    t.start()
     progs = [
-        'boulder-wfe',
-        'boulder-ra',
-        'boulder-sa',
-        'boulder-ca',
-        'boulder-va',
-        'boulder-publisher',
-        'ocsp-updater',
-        'ocsp-responder',
-        'ct-test-srv',
-        'dns-test-srv'
+        'boulder-wfe --config %s' % get_config('wfe'),
+        'boulder-ra --config %s' % get_config('ra'),
+        'boulder-sa --config %s' % get_config('sa'),
+        'boulder-ca --config %s' % get_config('ca'),
+        'boulder-va --config %s' % get_config('va'),
+        'boulder-publisher --config %s' % get_config('publisher'),
+        'ocsp-updater --config %s' % get_config('ocsp-updater'),
+        'ocsp-responder --config %s' % get_config('ocsp-responder'),
+        'ct-test-srv --config %s' % get_config('ct-test-srv'),
+        'dns-test-srv --config %s' % get_config('dns-test-srv'),
+        'mail-test-srv --config %s' % get_config('mail-test-srv'),
+        'ocsp-responder --config test/issuer-ocsp-responder.json',
+        'caa-checker --config cmd/caa-checker/test-config.yml'
     ]
     if not install(race_detection):
         return False
@@ -86,19 +86,11 @@ def start(race_detection):
             # Don't keep building stuff if a server has already died.
             return False
 
-    # Additionally run the issuer-ocsp-responder, which is not amenable to the
-    # above `run` pattern because it uses a different config file.
-    try:
-        processes.append(run('ocsp-responder', race_detection, 'test/issuer-ocsp-responder.json'))
-    except Exception as e:
-        print(e)
-        return False
-
     # Wait until all servers are up before returning to caller. This means
     # checking each server's debug port until it's available.
-    # seconds.
     while True:
         try:
+            time.sleep(0.3)
             # If one of the servers has died, quit immediately.
             if not check():
                 return False
@@ -113,7 +105,6 @@ def start(race_detection):
                 print "Waiting for debug port %d" % debug_port
             else:
                 raise
-        time.sleep(1)
 
     # Some servers emit extra text after their debug server is open. Sleep 1
     # second so the "servers running" message comes last.
@@ -123,7 +114,7 @@ def start(race_detection):
 
 def forward():
     """Add a TCP forwarder between Boulder and RabbitMQ to simulate failures."""
-    cmd = """exec listenbuddy -listen :5673 -speak localhost:5672"""
+    cmd = """exec listenbuddy -listen :5673 -speak boulder-rabbitmq:5672"""
     p = subprocess.Popen(cmd, shell=True)
     p.cmd = cmd
     print('started %s with pid %d' % (p.cmd, p.pid))

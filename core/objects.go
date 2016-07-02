@@ -1,13 +1,7 @@
-// Copyright 2014 ISRG.  All rights reserved
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
-
 package core
 
 import (
 	"crypto"
-	"crypto/subtle"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -16,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/letsencrypt/go-jose"
 	"github.com/letsencrypt/boulder/probs"
+	"github.com/square/go-jose"
 )
 
 // AcmeStatus defines the state of a given authorization
@@ -106,20 +100,20 @@ type AcmeIdentifier struct {
 
 // CertificateRequest is just a CSR
 //
-// This data is unmarshalled from JSON by way of rawCertificateRequest, which
+// This data is unmarshalled from JSON by way of RawCertificateRequest, which
 // represents the actual structure received from the client.
 type CertificateRequest struct {
 	CSR   *x509.CertificateRequest // The CSR
 	Bytes []byte                   // The original bytes of the CSR, for logging.
 }
 
-type rawCertificateRequest struct {
+type RawCertificateRequest struct {
 	CSR JSONBuffer `json:"csr"` // The encoded CSR
 }
 
 // UnmarshalJSON provides an implementation for decoding CertificateRequest objects.
 func (cr *CertificateRequest) UnmarshalJSON(data []byte) error {
-	var raw rawCertificateRequest
+	var raw RawCertificateRequest
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
@@ -136,7 +130,7 @@ func (cr *CertificateRequest) UnmarshalJSON(data []byte) error {
 
 // MarshalJSON provides an implementation for encoding CertificateRequest objects.
 func (cr CertificateRequest) MarshalJSON() ([]byte, error) {
-	return json.Marshal(rawCertificateRequest{
+	return json.Marshal(RawCertificateRequest{
 		CSR: cr.CSR.Raw,
 	})
 }
@@ -151,7 +145,7 @@ type Registration struct {
 	Key jose.JsonWebKey `json:"key"`
 
 	// Contact URIs
-	Contact []*AcmeURL `json:"contact,omitempty"`
+	Contact *[]*AcmeURL `json:"contact,omitempty"`
 
 	// Agreement with terms of service
 	Agreement string `json:"agreement,omitempty"`
@@ -166,7 +160,12 @@ type Registration struct {
 // MergeUpdate copies a subset of information from the input Registration
 // into this one.
 func (r *Registration) MergeUpdate(input Registration) {
-	if len(input.Contact) > 0 {
+	// Note: we allow input.Contact to overwrite r.Contact even if the former is
+	// empty in order to allow users to remove the contact associated with
+	// a registration. Since the field type is a pointer to slice of pointers we
+	// can perform a nil check to differentiate between an empty value and a nil
+	// (e.g. not provided) value
+	if input.Contact != nil {
 		r.Contact = input.Contact
 	}
 
@@ -179,7 +178,7 @@ func (r *Registration) MergeUpdate(input Registration) {
 // and the IP addresses that were resolved and used
 type ValidationRecord struct {
 	// DNS only
-	Authorities []string
+	Authorities []string `json:",omitempty"`
 
 	// SimpleHTTP only
 	URL string `json:"url,omitempty"`
@@ -191,96 +190,18 @@ type ValidationRecord struct {
 	AddressUsed       net.IP   `json:"addressUsed"`
 }
 
-// KeyAuthorization represents a domain holder's authorization for a
-// specific account key to satisfy a specific challenge.
-type KeyAuthorization struct {
-	Token      string
-	Thumbprint string
-}
-
-// NewKeyAuthorization computes the thumbprint and assembles the object
-func NewKeyAuthorization(token string, key *jose.JsonWebKey) (KeyAuthorization, error) {
-	if key == nil {
-		return KeyAuthorization{}, fmt.Errorf("Cannot authorize a nil key")
-	}
-
-	thumbprint, err := key.Thumbprint(crypto.SHA256)
-	if err != nil {
-		return KeyAuthorization{}, err
-	}
-
-	return KeyAuthorization{
-		Token:      token,
-		Thumbprint: base64.RawURLEncoding.EncodeToString(thumbprint),
-	}, nil
-}
-
-// NewKeyAuthorizationFromString parses the string and composes a key authorization struct
-func NewKeyAuthorizationFromString(input string) (ka KeyAuthorization, err error) {
-	parts := strings.Split(input, ".")
+func looksLikeKeyAuthorization(str string) error {
+	parts := strings.Split(str, ".")
 	if len(parts) != 2 {
-		err = fmt.Errorf("Invalid key authorization: %d parts", len(parts))
-		return
+		return fmt.Errorf("Invalid key authorization: does not look like a key authorization")
 	} else if !LooksLikeAToken(parts[0]) {
-		err = fmt.Errorf("Invalid key authorization: malformed token")
-		return
+		return fmt.Errorf("Invalid key authorization: malformed token")
 	} else if !LooksLikeAToken(parts[1]) {
 		// Thumbprints have the same syntax as tokens in boulder
 		// Both are base64-encoded and 32 octets
-		err = fmt.Errorf("Invalid key authorization: malformed key thumbprint")
-		return
+		return fmt.Errorf("Invalid key authorization: malformed key thumbprint")
 	}
-
-	ka = KeyAuthorization{
-		Token:      parts[0],
-		Thumbprint: parts[1],
-	}
-	return
-}
-
-// String produces the string representation of a key authorization
-func (ka KeyAuthorization) String() string {
-	return ka.Token + "." + ka.Thumbprint
-}
-
-// Match determines whether this KeyAuthorization matches the given token and key
-func (ka KeyAuthorization) Match(token string, key *jose.JsonWebKey) bool {
-	if key == nil {
-		return false
-	}
-
-	thumbprintBytes, err := key.Thumbprint(crypto.SHA256)
-	if err != nil {
-		return false
-	}
-	thumbprint := base64.RawURLEncoding.EncodeToString(thumbprintBytes)
-
-	tokensEqual := subtle.ConstantTimeCompare([]byte(token), []byte(ka.Token))
-	thumbprintsEqual := subtle.ConstantTimeCompare([]byte(thumbprint), []byte(ka.Thumbprint))
-
-	return tokensEqual == 1 && thumbprintsEqual == 1
-}
-
-// MarshalJSON packs a key authorization into its string representation
-func (ka KeyAuthorization) MarshalJSON() (result []byte, err error) {
-	return json.Marshal(ka.String())
-}
-
-// UnmarshalJSON unpacks a key authorization from a string
-func (ka *KeyAuthorization) UnmarshalJSON(data []byte) (err error) {
-	var str string
-	err = json.Unmarshal(data, &str)
-	if err != nil {
-		return err
-	}
-
-	parsed, err := NewKeyAuthorizationFromString(str)
-	if err != nil {
-		return err
-	}
-
-	*ka = parsed
-	return
+	return nil
 }
 
 // Challenge is an aggregate of all data needed for any challenges.
@@ -300,32 +221,38 @@ type Challenge struct {
 	// Contains the error that occurred during challenge validation, if any
 	Error *probs.ProblemDetails `json:"error,omitempty"`
 
-	// If successful, the time at which this challenge
-	// was completed by the server.
-	Validated *time.Time `json:"validated,omitempty"`
-
 	// A URI to which a response can be POSTed
 	URI string `json:"uri"`
 
 	// Used by http-01, tls-sni-01, and dns-01 challenges
 	Token string `json:"token,omitempty"` // Used by http-00, tls-sni-00, and dns-00 challenges
 
+	// The KeyAuthorization provided by the client to start validation of
+	// the challenge. Set during
+	//
+	//   POST /acme/authz/:authzid/:challid
+	//
 	// Used by http-01, tls-sni-01, and dns-01 challenges
-	KeyAuthorization *KeyAuthorization `json:"keyAuthorization,omitempty"`
+	ProvidedKeyAuthorization string `json:"keyAuthorization,omitempty"`
 
 	// Contains information about URLs used or redirected to and IPs resolved and
 	// used
 	ValidationRecord []ValidationRecord `json:"validationRecord,omitempty"`
+}
 
-	// The account key used to create this challenge.  This is not part of the
-	// spec, but clients are required to ignore unknown fields, so it's harmless
-	// to include.
-	//
-	// Boulder needs to remember what key was used to create a challenge in order
-	// to prevent an attacker from re-using a validation signature with a different,
-	// unauthorized key. See:
-	//   https://mailarchive.ietf.org/arch/msg/acme/F71iz6qq1o_QPVhJCV4dqWf-4Yc
-	AccountKey *jose.JsonWebKey `json:"accountKey,omitempty"`
+// ExpectedKeyAuthorization computes the expected KeyAuthorization value for
+// the challenge.
+func (ch Challenge) ExpectedKeyAuthorization(key *jose.JsonWebKey) (string, error) {
+	if key == nil {
+		return "", fmt.Errorf("Cannot authorize a nil key")
+	}
+
+	thumbprint, err := key.Thumbprint(crypto.SHA256)
+	if err != nil {
+		return "", err
+	}
+
+	return ch.Token + "." + base64.RawURLEncoding.EncodeToString(thumbprint), nil
 }
 
 // RecordsSane checks the sanity of a ValidationRecord object before sending it
@@ -358,7 +285,7 @@ func (ch Challenge) RecordsSane() bool {
 		if len(ch.ValidationRecord) > 1 {
 			return false
 		}
-		if len(ch.ValidationRecord[0].Authorities) == 0 || ch.ValidationRecord[0].Hostname == "" {
+		if ch.ValidationRecord[0].Hostname == "" {
 			return false
 		}
 		return true
@@ -369,6 +296,22 @@ func (ch Challenge) RecordsSane() bool {
 	return true
 }
 
+// IsSaneForClientOffer checks the fields of a challenge object before it is
+// given to the client.
+//
+// This function is an alias of Challenge.IsSane(false).
+func (ch Challenge) IsSaneForClientOffer() bool {
+	return ch.IsSane(false)
+}
+
+// IsSaneForValidation checks the fields of a challenge object before it is
+// given to the VA.
+//
+// This function is an alias of Challenge.IsSane(false).
+func (ch Challenge) IsSaneForValidation() bool {
+	return ch.IsSane(true)
+}
+
 // IsSane checks the sanity of a challenge object before issued to the client
 // (completed = false) and before validation (completed = true).
 func (ch Challenge) IsSane(completed bool) bool {
@@ -376,26 +319,19 @@ func (ch Challenge) IsSane(completed bool) bool {
 		return false
 	}
 
-	// There always needs to be an account key and token
-	if ch.AccountKey == nil || !LooksLikeAToken(ch.Token) {
+	// There always needs to be a token
+	if !LooksLikeAToken(ch.Token) {
 		return false
 	}
 
 	// Before completion, the key authorization field should be empty
-	if !completed && ch.KeyAuthorization != nil {
+	if !completed && ch.ProvidedKeyAuthorization != "" {
 		return false
 	}
 
-	// If the challenge is completed, then there should be a key authorization,
-	// and it should match the challenge.
-	if completed {
-		if ch.KeyAuthorization == nil {
-			return false
-		}
-
-		if !ch.KeyAuthorization.Match(ch.Token, ch.AccountKey) {
-			return false
-		}
+	// If the challenge is completed, then there should be a key authorization
+	if completed && looksLikeKeyAuthorization(ch.ProvidedKeyAuthorization) != nil {
+		return false
 	}
 
 	return true
@@ -505,19 +441,6 @@ type IdentifierData struct {
 	CertSHA1     string `db:"certSHA1"`     // The hex encoding of the SHA-1 hash of a cert containing the identifier
 }
 
-// ExternalCert holds information about certificates issued by other CAs,
-// obtained through Certificate Transparency, the SSL Observatory, or scans.io.
-type ExternalCert struct {
-	SHA1     string    `db:"sha1"`       // The hex encoding of the SHA-1 hash of this cert
-	Issuer   string    `db:"issuer"`     // The Issuer field of this cert
-	Subject  string    `db:"subject"`    // The Subject field of this cert
-	NotAfter time.Time `db:"notAfter"`   // Date after which this cert should be considered invalid
-	SPKI     []byte    `db:"spki"`       // The hex encoding of the certificate's SubjectPublicKeyInfo in DER form
-	Valid    bool      `db:"valid"`      // Whether this certificate was valid at LastUpdated time
-	EV       bool      `db:"ev"`         // Whether this cert was EV valid
-	CertDER  []byte    `db:"rawDERCert"` // DER (binary) encoding of the raw certificate
-}
-
 // CertificateStatus structs are internal to the server. They represent the
 // latest data about the status of the certificate, required for OCSP updating
 // and for validating that the subscriber has accepted the certificate.
@@ -585,13 +508,6 @@ type CRL struct {
 	CRL string `db:"crl"`
 }
 
-// DeniedCSR is a list of names we deny issuing.
-type DeniedCSR struct {
-	ID int `db:"id"`
-
-	Names string `db:"names"`
-}
-
 // OCSPSigningRequest is a transfer object representing an OCSP Signing Request
 type OCSPSigningRequest struct {
 	CertDER   []byte
@@ -639,4 +555,38 @@ var RevocationReasons = map[RevocationCode]string{
 	8:  "removeFromCRL", // needed?
 	9:  "privilegeWithdrawn",
 	10: "aAcompromise",
+}
+
+// FQDNSet contains the SHA256 hash of the lowercased, comma joined dNSNames
+// contained in a certificate.
+type FQDNSet struct {
+	ID      int64
+	SetHash []byte
+	Serial  string
+	Issued  time.Time
+	Expires time.Time
+}
+
+// GPDNSAnswer represents a DNS record returned by the Google Public DNS API
+type GPDNSAnswer struct {
+	Name string `json:"name"`
+	Type uint16 `json:"type"`
+	TTL  int    `json:"TTL"`
+	Data string `json:"data"`
+}
+
+// GPDNSAnswer represents a DNS record returned by the Google Public DNS API
+type GPDNSResponse struct {
+	// Ignored fields
+	//   tc
+	//   rd
+	//   ra
+	//   ad
+	//   cd
+	//   question
+	//   additional
+	//   edns_client_subnet
+	Status  int           `json:"Status"`
+	Answer  []GPDNSAnswer `json:"Answer"`
+	Comment string        `json:"Comment"`
 }

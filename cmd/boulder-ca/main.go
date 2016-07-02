@@ -1,44 +1,102 @@
-// Copyright 2014 ISRG.  All rights reserved
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
-
 package main
 
 import (
 	"crypto"
+	"crypto/x509"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io/ioutil"
+	"os"
 
-	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/cactus/go-statsd-client/statsd"
-	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/cloudflare/cfssl/crypto/pkcs11key"
-	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/cloudflare/cfssl/helpers"
-	"github.com/letsencrypt/boulder/Godeps/_workspace/src/github.com/jmhodges/clock"
+	"github.com/cloudflare/cfssl/helpers"
+	"github.com/jmhodges/clock"
+	"github.com/letsencrypt/pkcs11key"
+
 	"github.com/letsencrypt/boulder/ca"
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/core"
-	blog "github.com/letsencrypt/boulder/log"
+	bgrpc "github.com/letsencrypt/boulder/grpc"
 	"github.com/letsencrypt/boulder/policy"
+	pubPB "github.com/letsencrypt/boulder/publisher/proto"
 	"github.com/letsencrypt/boulder/rpc"
-	"github.com/letsencrypt/boulder/sa"
 )
 
 const clientName = "CA"
 
-func loadPrivateKey(keyConfig cmd.KeyConfig) (crypto.Signer, error) {
-	if keyConfig.File != "" {
-		keyBytes, err := ioutil.ReadFile(keyConfig.File)
+type config struct {
+	CA cmd.CAConfig
+
+	*cmd.AllowedSigningAlgos
+
+	PA cmd.PAConfig
+
+	cmd.StatsdConfig
+
+	cmd.SyslogConfig
+
+	Common struct {
+		// Path to a PEM-encoded copy of the issuer certificate.
+		IssuerCert string
+	}
+}
+
+func loadIssuers(c config) ([]ca.Issuer, error) {
+	if c.CA.Key != nil {
+		issuerConfig := *c.CA.Key
+		issuerConfig.CertFile = c.Common.IssuerCert
+		priv, cert, err := loadIssuer(issuerConfig)
+		return []ca.Issuer{{
+			Signer: priv,
+			Cert:   cert,
+		}}, err
+	}
+	var issuers []ca.Issuer
+	for _, issuerConfig := range c.CA.Issuers {
+		priv, cert, err := loadIssuer(issuerConfig)
+		cmd.FailOnError(err, "Couldn't load private key")
+		issuers = append(issuers, ca.Issuer{
+			Signer: priv,
+			Cert:   cert,
+		})
+	}
+	return issuers, nil
+}
+
+func loadIssuer(issuerConfig cmd.IssuerConfig) (crypto.Signer, *x509.Certificate, error) {
+	cert, err := core.LoadCert(issuerConfig.CertFile)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	signer, err := loadSigner(issuerConfig)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if !core.KeyDigestEquals(signer.Public(), cert.PublicKey) {
+		return nil, nil, fmt.Errorf("Issuer key did not match issuer cert %s", issuerConfig.CertFile)
+	}
+	return signer, cert, err
+}
+
+func loadSigner(issuerConfig cmd.IssuerConfig) (crypto.Signer, error) {
+	if issuerConfig.File != "" {
+		keyBytes, err := ioutil.ReadFile(issuerConfig.File)
 		if err != nil {
-			return nil, fmt.Errorf("Could not read key file %s", keyConfig.File)
+			return nil, fmt.Errorf("Could not read key file %s", issuerConfig.File)
 		}
 
-		return helpers.ParsePrivateKeyPEM(keyBytes)
+		signer, err := helpers.ParsePrivateKeyPEM(keyBytes)
+		if err != nil {
+			return nil, err
+		}
+		return signer, nil
 	}
 
 	var pkcs11Config *pkcs11key.Config
-	if keyConfig.ConfigFile != "" {
-		contents, err := ioutil.ReadFile(keyConfig.ConfigFile)
+	if issuerConfig.ConfigFile != "" {
+		contents, err := ioutil.ReadFile(issuerConfig.ConfigFile)
 		if err != nil {
 			return nil, err
 		}
@@ -48,7 +106,7 @@ func loadPrivateKey(keyConfig cmd.KeyConfig) (crypto.Signer, error) {
 			return nil, err
 		}
 	} else {
-		pkcs11Config = keyConfig.PKCS11
+		pkcs11Config = issuerConfig.PKCS11
 	}
 	if pkcs11Config.Module == "" ||
 		pkcs11Config.TokenLabel == "" ||
@@ -61,57 +119,67 @@ func loadPrivateKey(keyConfig cmd.KeyConfig) (crypto.Signer, error) {
 }
 
 func main() {
-	app := cmd.NewAppShell("boulder-ca", "Handles issuance operations")
-	app.Action = func(c cmd.Config, stats statsd.Statter, auditlogger *blog.AuditLogger) {
-		// Validate PA config and set defaults if needed
-		cmd.FailOnError(c.PA.CheckChallenges(), "Invalid PA configuration")
-
-		// AUDIT[ Error Conditions ] 9cc4d537-8534-4970-8665-4b382abe82f3
-		defer auditlogger.AuditPanic()
-
-		blog.SetAuditLogger(auditlogger)
-
-		go cmd.DebugServer(c.CA.DebugAddr)
-
-		dbURL, err := c.PA.DBConfig.URL()
-		cmd.FailOnError(err, "Couldn't load DB URL")
-		paDbMap, err := sa.NewDbMap(dbURL)
-		cmd.FailOnError(err, "Couldn't connect to policy database")
-		pa, err := policy.NewPolicyAuthorityImpl(paDbMap, c.PA.EnforcePolicyWhitelist, c.PA.Challenges)
-		cmd.FailOnError(err, "Couldn't create PA")
-
-		priv, err := loadPrivateKey(c.CA.Key)
-		cmd.FailOnError(err, "Couldn't load private key")
-
-		issuer, err := core.LoadCert(c.Common.IssuerCert)
-		cmd.FailOnError(err, "Couldn't load issuer cert")
-
-		cai, err := ca.NewCertificateAuthorityImpl(
-			c.CA,
-			clock.Default(),
-			stats,
-			issuer,
-			priv,
-			c.KeyPolicy())
-		cmd.FailOnError(err, "Failed to create CA impl")
-		cai.PA = pa
-
-		go cmd.ProfileCmd("CA", stats)
-
-		amqpConf := c.CA.AMQP
-		cai.SA, err = rpc.NewStorageAuthorityClient(clientName, amqpConf, stats)
-		cmd.FailOnError(err, "Failed to create SA client")
-
-		cai.Publisher, err = rpc.NewPublisherClient(clientName, amqpConf, stats)
-		cmd.FailOnError(err, "Failed to create Publisher client")
-
-		cas, err := rpc.NewAmqpRPCServer(amqpConf, c.CA.MaxConcurrentRPCServerRequests, stats)
-		cmd.FailOnError(err, "Unable to create CA RPC server")
-		rpc.NewCertificateAuthorityServer(cas, cai)
-
-		err = cas.Start(amqpConf)
-		cmd.FailOnError(err, "Unable to run CA RPC server")
+	configFile := flag.String("config", "", "File path to the configuration file for this service")
+	flag.Parse()
+	if *configFile == "" {
+		flag.Usage()
+		os.Exit(1)
 	}
 
-	app.Run()
+	var c config
+	err := cmd.ReadJSONFile(*configFile, &c)
+	cmd.FailOnError(err, "Reading JSON config file into config structure")
+
+	go cmd.DebugServer(c.CA.DebugAddr)
+
+	stats, logger := cmd.StatsAndLogging(c.StatsdConfig, c.SyslogConfig)
+	defer logger.AuditPanic()
+	logger.Info(cmd.VersionString(clientName))
+
+	cmd.FailOnError(c.PA.CheckChallenges(), "Invalid PA configuration")
+
+	pa, err := policy.New(c.PA.Challenges)
+	cmd.FailOnError(err, "Couldn't create PA")
+
+	if c.CA.HostnamePolicyFile == "" {
+		cmd.FailOnError(fmt.Errorf("HostnamePolicyFile was empty."), "")
+	}
+	err = pa.SetHostnamePolicyFile(c.CA.HostnamePolicyFile)
+	cmd.FailOnError(err, "Couldn't load hostname policy file")
+
+	issuers, err := loadIssuers(c)
+	cmd.FailOnError(err, "Couldn't load issuers")
+
+	cai, err := ca.NewCertificateAuthorityImpl(
+		c.CA,
+		clock.Default(),
+		stats,
+		issuers,
+		c.KeyPolicy(),
+		logger)
+	cmd.FailOnError(err, "Failed to create CA impl")
+	cai.PA = pa
+
+	go cmd.ProfileCmd("CA", stats)
+
+	amqpConf := c.CA.AMQP
+	cai.SA, err = rpc.NewStorageAuthorityClient(clientName, amqpConf, stats)
+	cmd.FailOnError(err, "Failed to create SA client")
+
+	if c.CA.PublisherService != nil {
+		conn, err := bgrpc.ClientSetup(c.CA.PublisherService)
+		cmd.FailOnError(err, "Failed to load credentials and create connection to service")
+		cai.Publisher = bgrpc.NewPublisherClientWrapper(pubPB.NewPublisherClient(conn), c.CA.PublisherService.Timeout.Duration)
+	} else {
+		cai.Publisher, err = rpc.NewPublisherClient(clientName, amqpConf, stats)
+		cmd.FailOnError(err, "Failed to create Publisher client")
+	}
+
+	cas, err := rpc.NewAmqpRPCServer(amqpConf, c.CA.MaxConcurrentRPCServerRequests, stats, logger)
+	cmd.FailOnError(err, "Unable to create CA RPC server")
+	err = rpc.NewCertificateAuthorityServer(cas, cai)
+	cmd.FailOnError(err, "Failed to create Certificate Authority RPC server")
+
+	err = cas.Start(amqpConf)
+	cmd.FailOnError(err, "Unable to run CA RPC server")
 }
