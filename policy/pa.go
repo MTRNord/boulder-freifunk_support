@@ -339,6 +339,13 @@ func extractDomainIANASuffix(name string) (string, error) {
 	if suffix2 == "" {
 		suffix = name
 	}
+	
+	if suffix2 != "" {
+		suffix = suffix2
+	}
+	
+	fmt.Println(suffix)
+	fmt.Println(suffix2)
 
 	return suffix, nil
 }
