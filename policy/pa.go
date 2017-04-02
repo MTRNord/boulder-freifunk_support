@@ -324,17 +324,20 @@ func extractDomainIANASuffix(name string) (string, error) {
 
 	rule := publicsuffix.DefaultList.Find(name, &publicsuffix.FindOptions{IgnorePrivate: true, DefaultRule: nil})
 	
+	suffix := ""
 	
 	if rule == nil {
-		suffix := name
+		suffix = name
 	}
 
-	suffix := rule.Decompose(name)[1]
 
 	// If the TLD is empty, it means name is actually a suffix.
 	// In fact, decompose returns an array of empty strings in this case.
 	if suffix == "" {
-		suffix = name
+		suffix2 := rule.Decompose(name)[1]
+		if suffix2 == "" {
+			suffix = name
+		}
 	}
 
 	return suffix, nil
