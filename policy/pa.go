@@ -326,6 +326,8 @@ func extractDomainIANASuffix(name string) (string, error) {
 	
 	suffix := ""
 	
+	suffix2 := rule.Decompose(name)[1]
+	
 	if rule == nil {
 		sliced := strings.Split(name, ".")
 		suffix = sliced[len(sliced)-1]
@@ -334,11 +336,8 @@ func extractDomainIANASuffix(name string) (string, error) {
 
 	// If the TLD is empty, it means name is actually a suffix.
 	// In fact, decompose returns an array of empty strings in this case.
-	if suffix == "" {
-		suffix2 := rule.Decompose(name)[1]
-		if suffix2 == "" {
-			suffix = name
-		}
+	if suffix2 == "" {
+		suffix = name
 	}
 
 	return suffix, nil
