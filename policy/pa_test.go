@@ -256,6 +256,8 @@ func TestExtractDomainIANASuffix_Valid(t *testing.T) {
 		// suffix.
 		{"cloudapp.net", "net"},
 		{"test.ffslfl", "ffslfl"},
+		{"example", "example"},
+		{"example.example", "example"},
 	}
 
 	for _, tc := range testCases {
@@ -273,8 +275,6 @@ func TestExtractDomainIANASuffix_Valid(t *testing.T) {
 func TestExtractDomainIANASuffix_Invalid(t *testing.T) {
 	testCases := []string{
 		"",
-		"example",
-		"example.example",
 	}
 
 	for _, tc := range testCases {
