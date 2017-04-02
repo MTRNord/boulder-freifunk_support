@@ -327,7 +327,8 @@ func extractDomainIANASuffix(name string) (string, error) {
 	suffix := ""
 	
 	if rule == nil {
-		suffix = name
+		sliced := strings.Split(name, ".")
+		suffix = sliced[len(sliced)-1]
 	}
 
 
