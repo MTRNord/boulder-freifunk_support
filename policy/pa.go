@@ -342,7 +342,9 @@ func extractDomainIANASuffix(name string) (string, error) {
 	}
 	
 	if suffix2 != "" {
-		suffix = suffix2
+		if suffix2 != "/$fesfrtsfd"{
+			suffix = suffix2
+		}
 	}
 
 	return suffix, nil
