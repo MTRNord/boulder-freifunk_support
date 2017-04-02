@@ -10,9 +10,10 @@ import (
 	"time"
 
 	"github.com/jmhodges/clock"
-	"github.com/letsencrypt/boulder/metrics"
 	"github.com/miekg/dns"
 	"golang.org/x/net/context"
+
+	"github.com/letsencrypt/boulder/metrics"
 )
 
 func parseCidr(network string, comment string) net.IPNet {
@@ -133,6 +134,11 @@ var (
 		parseCidr("fc00::/7", "RFC 4193: Unique-Local"),
 		parseCidr("fe80::/10", "RFC 4291: Section 2.5.6 Link-Scoped Unicast"),
 		parseCidr("ff00::/8", "RFC 4291: Section 2.7"),
+		// We disable validations to IPs under the 6to4 anycase prefix because
+		// there's too much risk of a malicious actor advertising the prefix and
+		// answering validations for a 6to4 host they do not control.
+		// https://community.letsencrypt.org/t/problems-validating-ipv6-against-host-running-6to4/18312/9
+		parseCidr("2002::/16", "RFC 7526: 6to4 anycast prefix deprecated"),
 	}
 )
 
@@ -153,7 +159,6 @@ type DNSResolverImpl struct {
 	// for CAA queries that get a temporary pass during a notification period.
 	caaSERVFAILExceptions map[string]bool
 	maxTries              int
-	LookupIPv6            bool
 	clk                   clock.Clock
 	stats                 metrics.Scope
 	txtStats              metrics.Scope
@@ -179,6 +184,7 @@ func NewDNSResolverImpl(
 	clk clock.Clock,
 	maxTries int,
 ) *DNSResolverImpl {
+	stats = stats.NewScope("DNS")
 	// TODO(jmhodges): make constructor use an Option func pattern
 	dnsClient := new(dns.Client)
 
@@ -353,16 +359,14 @@ func (dnsResolver *DNSResolverImpl) LookupHost(ctx context.Context, hostname str
 		defer wg.Done()
 		recordsA, errA = dnsResolver.lookupIP(ctx, hostname, dns.TypeA, dnsResolver.aStats)
 	}()
-	if dnsResolver.LookupIPv6 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			recordsAAAA, errAAAA = dnsResolver.lookupIP(ctx, hostname, dns.TypeAAAA, dnsResolver.aaaaStats)
-		}()
-	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		recordsAAAA, errAAAA = dnsResolver.lookupIP(ctx, hostname, dns.TypeAAAA, dnsResolver.aaaaStats)
+	}()
 	wg.Wait()
 
-	if errA != nil && (errAAAA != nil || !dnsResolver.LookupIPv6) {
+	if errA != nil && errAAAA != nil {
 		return nil, errA
 	}
 

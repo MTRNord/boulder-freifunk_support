@@ -7,79 +7,10 @@ import (
 	"net"
 	"testing"
 
-	"github.com/square/go-jose"
+	"gopkg.in/square/go-jose.v1"
 
 	"github.com/letsencrypt/boulder/test"
 )
-
-func TestRegistrationUpdate(t *testing.T) {
-	oldURL, _ := ParseAcmeURL("http://old.invalid")
-	newURL, _ := ParseAcmeURL("http://new.invalid")
-	reg := Registration{
-		ID:        1,
-		Contact:   &[]*AcmeURL{oldURL},
-		Agreement: "",
-	}
-	update := Registration{
-		Contact:   &[]*AcmeURL{newURL},
-		Agreement: "totally!",
-	}
-
-	reg.MergeUpdate(update)
-	test.Assert(t, len(*reg.Contact) == 1 && (*reg.Contact)[0] == (*update.Contact)[0], "Contact was not updated %v != %v")
-	test.Assert(t, reg.Agreement == update.Agreement, "Agreement was not updated")
-}
-
-func TestRegistrationContactUpdate(t *testing.T) {
-	contactURL, _ := ParseAcmeURL("mailto://example@example.com")
-	fullReg := Registration{
-		ID:        1,
-		Contact:   &[]*AcmeURL{contactURL},
-		Agreement: "totally!",
-	}
-
-	// Test that a registration contact can be removed by updating with an empty
-	// Contact slice.
-	reg := fullReg
-	var contactRemoveUpdate Registration
-	contactRemoveJSON := []byte(`
-	{
-		"key": {
-			"e": "AQAB",
-			"kty": "RSA",
-			"n": "tSwgy3ORGvc7YJI9B2qqkelZRUC6F1S5NwXFvM4w5-M0TsxbFsH5UH6adigV0jzsDJ5imAechcSoOhAh9POceCbPN1sTNwLpNbOLiQQ7RD5mY_"
-		},
-		"id": 1,
-		"contact": [],
-		"agreement": "totally!"
-	}
-	`)
-	err := json.Unmarshal(contactRemoveJSON, &contactRemoveUpdate)
-	test.AssertNotError(t, err, "Failed to unmarshal contactRemoveJSON")
-	reg.MergeUpdate(contactRemoveUpdate)
-	test.Assert(t, len(*reg.Contact) == 0, "Contact was not deleted in update")
-
-	// Test that a registration contact isn't changed when an update is performed
-	// with no Contact field
-	reg = fullReg
-	var contactSameUpdate Registration
-	contactSameJSON := []byte(`
-	{
-		"key": {
-			"e": "AQAB",
-			"kty": "RSA",
-			"n": "tSwgy3ORGvc7YJI9B2qqkelZRUC6F1S5NwXFvM4w5-M0TsxbFsH5UH6adigV0jzsDJ5imAechcSoOhAh9POceCbPN1sTNwLpNbOLiQQ7RD5mY_"
-		},
-		"id": 1,
-		"agreement": "changed my mind!"
-	}
-	`)
-	err = json.Unmarshal(contactSameJSON, &contactSameUpdate)
-	test.AssertNotError(t, err, "Failed to unmarshal contactSameJSON")
-	reg.MergeUpdate(contactSameUpdate)
-	test.Assert(t, len(*reg.Contact) == 1, "len(Contact) was updated unexpectedly")
-	test.Assert(t, (*reg.Contact)[0].String() == "mailto://example@example.com", "Contact was changed unexpectedly")
-}
 
 func TestExpectedKeyAuthorization(t *testing.T) {
 	ch := Challenge{Token: "hi"}
@@ -126,7 +57,7 @@ func TestChallengeSanityCheck(t *testing.T) {
   }`), &accountKey)
 	test.AssertNotError(t, err, "Error unmarshaling JWK")
 
-	types := []string{ChallengeTypeHTTP01, ChallengeTypeTLSSNI01, ChallengeTypeDNS01}
+	types := []string{ChallengeTypeHTTP01, ChallengeTypeTLSSNI01, ChallengeTypeTLSSNI02, ChallengeTypeDNS01}
 	for _, challengeType := range types {
 		chall := Challenge{
 			Type:   challengeType,

@@ -13,14 +13,18 @@ import (
 
 	cfsslConfig "github.com/cloudflare/cfssl/config"
 	"github.com/cloudflare/cfssl/helpers"
+	"github.com/golang/mock/gomock"
 	"github.com/jmhodges/clock"
+	"github.com/letsencrypt/boulder/metrics/mock_metrics"
 	"golang.org/x/crypto/ocsp"
 	"golang.org/x/net/context"
 
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/core"
+	berrors "github.com/letsencrypt/boulder/errors"
 	"github.com/letsencrypt/boulder/goodkey"
 	blog "github.com/letsencrypt/boulder/log"
+	"github.com/letsencrypt/boulder/metrics"
 	"github.com/letsencrypt/boulder/mocks"
 	"github.com/letsencrypt/boulder/policy"
 	"github.com/letsencrypt/boulder/test"
@@ -133,7 +137,7 @@ type testCtx struct {
 	issuers   []Issuer
 	keyPolicy goodkey.KeyPolicy
 	fc        clock.FakeClock
-	stats     *mocks.Statter
+	stats     metrics.Scope
 	logger    blog.Logger
 }
 
@@ -179,13 +183,11 @@ func setup(t *testing.T) *testCtx {
 		Expiry:       "8760h",
 		LifespanOCSP: cmd.ConfigDuration{Duration: 45 * time.Minute},
 		MaxNames:     2,
-		DoNotForceCN: true,
 		CFSSL: cfsslConfig.Config{
 			Signing: &cfsslConfig.Signing{
 				Profiles: map[string]*cfsslConfig.SigningProfile{
 					rsaProfileName: {
 						Usage:     []string{"digital signature", "key encipherment", "server auth"},
-						CA:        false,
 						IssuerURL: []string{"http://not-example.com/issuer-url"},
 						OCSP:      "http://not-example.com/ocsp",
 						CRL:       "http://not-example.com/crl",
@@ -209,7 +211,6 @@ func setup(t *testing.T) *testCtx {
 					},
 					ecdsaProfileName: {
 						Usage:     []string{"digital signature", "server auth"},
-						CA:        false,
 						IssuerURL: []string{"http://not-example.com/issuer-url"},
 						OCSP:      "http://not-example.com/ocsp",
 						CRL:       "http://not-example.com/crl",
@@ -236,8 +237,6 @@ func setup(t *testing.T) *testCtx {
 		},
 	}
 
-	stats := mocks.NewStatter()
-
 	issuers := []Issuer{{caKey, caCert}}
 
 	keyPolicy := goodkey.KeyPolicy{
@@ -254,7 +253,7 @@ func setup(t *testing.T) *testCtx {
 		issuers,
 		keyPolicy,
 		fc,
-		stats,
+		metrics.NewNoopScope(),
 		logger,
 	}
 }
@@ -283,6 +282,7 @@ func TestIssueCertificate(t *testing.T) {
 		testCtx.keyPolicy,
 		testCtx.logger)
 	test.AssertNotError(t, err, "Failed to create CA")
+	ca.forceCNFromSAN = false
 	ca.Publisher = &mocks.Publisher{}
 	ca.PA = testCtx.pa
 	sa := &mockSA{}
@@ -390,7 +390,7 @@ func TestOCSP(t *testing.T) {
 	test.AssertEquals(t, parsed.SerialNumber.Cmp(parsedCert.SerialNumber), 0)
 
 	// Test that signatures are checked.
-	ocspResp, err = ca.GenerateOCSP(ctx, core.OCSPSigningRequest{
+	_, err = ca.GenerateOCSP(ctx, core.OCSPSigningRequest{
 		CertDER: append(cert.DER, byte(0)),
 		Status:  string(core.OCSPStatusGood),
 	})
@@ -472,8 +472,7 @@ func TestNoHostnames(t *testing.T) {
 	csr, _ := x509.ParseCertificateRequest(NoNamesCSR)
 	_, err = ca.IssueCertificate(ctx, *csr, 1001)
 	test.AssertError(t, err, "Issued certificate with no names")
-	_, ok := err.(core.MalformedRequestError)
-	test.Assert(t, ok, "Incorrect error type returned")
+	test.Assert(t, berrors.Is(err, berrors.Malformed), "Incorrect error type returned")
 }
 
 func TestRejectTooManyNames(t *testing.T) {
@@ -494,8 +493,7 @@ func TestRejectTooManyNames(t *testing.T) {
 	csr, _ := x509.ParseCertificateRequest(TooManyNameCSR)
 	_, err = ca.IssueCertificate(ctx, *csr, 1001)
 	test.AssertError(t, err, "Issued certificate with too many names")
-	_, ok := err.(core.MalformedRequestError)
-	test.Assert(t, ok, "Incorrect error type returned")
+	test.Assert(t, berrors.Is(err, berrors.Malformed), "Incorrect error type returned")
 }
 
 func TestRejectValidityTooLong(t *testing.T) {
@@ -521,8 +519,7 @@ func TestRejectValidityTooLong(t *testing.T) {
 	csr, _ := x509.ParseCertificateRequest(NoCNCSR)
 	_, err = ca.IssueCertificate(ctx, *csr, 1)
 	test.AssertError(t, err, "Cannot issue a certificate that expires after the intermediate certificate")
-	_, ok := err.(core.InternalServerError)
-	test.Assert(t, ok, "Incorrect error type returned")
+	test.Assert(t, berrors.Is(err, berrors.InternalServer), "Incorrect error type returned")
 }
 
 func TestShortKey(t *testing.T) {
@@ -542,8 +539,7 @@ func TestShortKey(t *testing.T) {
 	csr, _ := x509.ParseCertificateRequest(ShortKeyCSR)
 	_, err = ca.IssueCertificate(ctx, *csr, 1001)
 	test.AssertError(t, err, "Issued a certificate with too short a key.")
-	_, ok := err.(core.MalformedRequestError)
-	test.Assert(t, ok, "Incorrect error type returned")
+	test.Assert(t, berrors.Is(err, berrors.Malformed), "Incorrect error type returned")
 }
 
 func TestAllowNoCN(t *testing.T) {
@@ -556,6 +552,7 @@ func TestAllowNoCN(t *testing.T) {
 		testCtx.keyPolicy,
 		testCtx.logger)
 	test.AssertNotError(t, err, "Couldn't create new CA")
+	ca.forceCNFromSAN = false
 	ca.Publisher = &mocks.Publisher{}
 	ca.PA = testCtx.pa
 	ca.SA = &mockSA{}
@@ -603,8 +600,7 @@ func TestLongCommonName(t *testing.T) {
 	csr, _ := x509.ParseCertificateRequest(LongCNCSR)
 	_, err = ca.IssueCertificate(ctx, *csr, 1001)
 	test.AssertError(t, err, "Issued a certificate with a CN over 64 bytes.")
-	_, ok := err.(core.MalformedRequestError)
-	test.Assert(t, ok, "Incorrect error type returned")
+	test.Assert(t, berrors.Is(err, berrors.Malformed), "Incorrect error type returned")
 }
 
 func TestWrongSignature(t *testing.T) {
@@ -670,6 +666,7 @@ func TestProfileSelection(t *testing.T) {
 }
 
 func countMustStaple(t *testing.T, cert *x509.Certificate) (count int) {
+	oidTLSFeature := asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 24}
 	for _, ext := range cert.Extensions {
 		if ext.Id.Equal(oidTLSFeature) {
 			test.Assert(t, !ext.Critical, "Extension was marked critical")
@@ -683,10 +680,15 @@ func countMustStaple(t *testing.T, cert *x509.Certificate) (count int) {
 func TestExtensions(t *testing.T) {
 	testCtx := setup(t)
 	testCtx.caConfig.MaxNames = 3
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	stats := mock_metrics.NewMockScope(ctrl)
+
 	ca, err := NewCertificateAuthorityImpl(
 		testCtx.caConfig,
 		testCtx.fc,
-		testCtx.stats,
+		stats,
 		testCtx.issuers,
 		testCtx.keyPolicy,
 		testCtx.logger)
@@ -714,38 +716,38 @@ func TestExtensions(t *testing.T) {
 		return cert
 	}
 
-	// With enableMustStaple = false, should issue successfully and not add
+	// With ca.enableMustStaple = false, should issue successfully and not add
 	// Must Staple.
+	stats.EXPECT().Inc(metricCSRExtensionTLSFeature, int64(1)).Return(nil)
+	stats.EXPECT().Inc("Signatures.Certificate", int64(1)).Return(nil)
 	noStapleCert := sign(mustStapleCSR)
 	test.AssertEquals(t, countMustStaple(t, noStapleCert), 0)
 
-	// With enableMustStaple = true, a TLS feature extension should put a must-staple
+	// With ca.enableMustStaple = true, a TLS feature extension should put a must-staple
 	// extension into the cert
 	ca.enableMustStaple = true
+	stats.EXPECT().Inc(metricCSRExtensionTLSFeature, int64(1)).Return(nil)
+	stats.EXPECT().Inc("Signatures.Certificate", int64(1)).Return(nil)
 	singleStapleCert := sign(mustStapleCSR)
 	test.AssertEquals(t, countMustStaple(t, singleStapleCert), 1)
-	test.AssertEquals(t, testCtx.stats.Counters[metricCSRExtensionTLSFeature], int64(2))
 
 	// Even if there are multiple TLS Feature extensions, only one extension should be included
+	stats.EXPECT().Inc(metricCSRExtensionTLSFeature, int64(1)).Return(nil)
+	stats.EXPECT().Inc("Signatures.Certificate", int64(1)).Return(nil)
 	duplicateMustStapleCert := sign(duplicateMustStapleCSR)
 	test.AssertEquals(t, countMustStaple(t, duplicateMustStapleCert), 1)
-	test.AssertEquals(t, testCtx.stats.Counters[metricCSRExtensionTLSFeature], int64(3))
 
 	// ... but if it doesn't ask for stapling, there should be an error
+	stats.EXPECT().Inc(metricCSRExtensionTLSFeature, int64(1)).Return(nil)
+	stats.EXPECT().Inc(metricCSRExtensionTLSFeatureInvalid, int64(1)).Return(nil)
 	_, err = ca.IssueCertificate(ctx, *tlsFeatureUnknownCSR, 1001)
 	test.AssertError(t, err, "Allowed a CSR with an empty TLS feature extension")
-	if _, ok := err.(core.MalformedRequestError); !ok {
-		t.Errorf("Wrong error type when rejecting a CSR with empty TLS feature extension")
-	}
-	test.AssertEquals(t, testCtx.stats.Counters[metricCSRExtensionTLSFeature], int64(4))
-	test.AssertEquals(t, testCtx.stats.Counters[metricCSRExtensionTLSFeatureInvalid], int64(1))
+	test.Assert(t, berrors.Is(err, berrors.Malformed), "Wrong error type when rejecting a CSR with empty TLS feature extension")
 
 	// Unsupported extensions should be silently ignored, having the same
 	// extensions as the TLS Feature cert above, minus the TLS Feature Extension
+	stats.EXPECT().Inc(metricCSRExtensionOther, int64(1)).Return(nil)
+	stats.EXPECT().Inc("Signatures.Certificate", int64(1)).Return(nil)
 	unsupportedExtensionCert := sign(unsupportedExtensionCSR)
 	test.AssertEquals(t, len(unsupportedExtensionCert.Extensions), len(singleStapleCert.Extensions)-1)
-	test.AssertEquals(t, testCtx.stats.Counters[metricCSRExtensionOther], int64(1))
-
-	// None of the above CSRs have basic extensions
-	test.AssertEquals(t, testCtx.stats.Counters[metricCSRExtensionBasic], int64(0))
 }

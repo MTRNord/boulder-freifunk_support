@@ -4,12 +4,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cactus/go-statsd-client/statsd"
 	"github.com/jmhodges/clock"
 	"golang.org/x/net/context"
 
 	"github.com/letsencrypt/boulder/core"
 	blog "github.com/letsencrypt/boulder/log"
+	"github.com/letsencrypt/boulder/metrics"
 	"github.com/letsencrypt/boulder/sa"
 	"github.com/letsencrypt/boulder/sa/satest"
 	"github.com/letsencrypt/boulder/test"
@@ -30,28 +30,51 @@ func TestPurgeAuthzs(t *testing.T) {
 	}
 	cleanUp := test.ResetSATestDatabase(t)
 	defer cleanUp()
-	stats, _ := statsd.NewNoopClient(nil)
+	stats := metrics.NewNoopScope()
 
 	p := expiredAuthzPurger{stats, log, fc, dbMap, 1}
 
-	rows, err := p.purgeAuthzs(time.Time{}, true)
+	err = p.purgeAuthzs(time.Time{}, true)
 	test.AssertNotError(t, err, "purgeAuthzs failed")
-	test.AssertEquals(t, rows, int64(0))
 
 	old, new := fc.Now().Add(-time.Hour), fc.Now().Add(time.Hour)
 
 	reg := satest.CreateWorkingRegistration(t, ssa)
-	_, err = ssa.NewPendingAuthorization(context.Background(), core.Authorization{RegistrationID: reg.ID, Expires: &old})
+	_, err = ssa.NewPendingAuthorization(context.Background(), core.Authorization{
+		RegistrationID: reg.ID,
+		Expires:        &old,
+		Challenges:     []core.Challenge{{ID: 1}},
+	})
 	test.AssertNotError(t, err, "NewPendingAuthorization failed")
-	_, err = ssa.NewPendingAuthorization(context.Background(), core.Authorization{RegistrationID: reg.ID, Expires: &old})
+	_, err = ssa.NewPendingAuthorization(context.Background(), core.Authorization{
+		RegistrationID: reg.ID,
+		Expires:        &old,
+		Challenges:     []core.Challenge{{ID: 2}},
+	})
 	test.AssertNotError(t, err, "NewPendingAuthorization failed")
-	_, err = ssa.NewPendingAuthorization(context.Background(), core.Authorization{RegistrationID: reg.ID, Expires: &new})
+	_, err = ssa.NewPendingAuthorization(context.Background(), core.Authorization{
+		RegistrationID: reg.ID,
+		Expires:        &new,
+		Challenges:     []core.Challenge{{ID: 3}},
+	})
 	test.AssertNotError(t, err, "NewPendingAuthorization failed")
 
-	rows, err = p.purgeAuthzs(fc.Now(), true)
+	err = p.purgeAuthzs(fc.Now(), true)
 	test.AssertNotError(t, err, "purgeAuthzs failed")
-	test.AssertEquals(t, rows, int64(2))
-	rows, err = p.purgeAuthzs(fc.Now().Add(time.Hour), true)
+	count, err := dbMap.SelectInt("SELECT COUNT(1) FROM pendingAuthorizations")
+	test.AssertNotError(t, err, "dbMap.SelectInt failed")
+	test.AssertEquals(t, count, int64(1))
+	count, err = dbMap.SelectInt("SELECT COUNT(1) FROM challenges")
+	test.AssertNotError(t, err, "dbMap.SelectInt failed")
+	test.AssertEquals(t, count, int64(1))
+
+	err = p.purgeAuthzs(fc.Now().Add(time.Hour), true)
 	test.AssertNotError(t, err, "purgeAuthzs failed")
-	test.AssertEquals(t, rows, int64(1))
+	count, err = dbMap.SelectInt("SELECT COUNT(1) FROM pendingAuthorizations")
+	test.AssertNotError(t, err, "dbMap.SelectInt failed")
+	test.AssertEquals(t, count, int64(0))
+	count, err = dbMap.SelectInt("SELECT COUNT(1) FROM challenges")
+	test.AssertNotError(t, err, "dbMap.SelectInt failed")
+	test.AssertEquals(t, count, int64(0))
+
 }

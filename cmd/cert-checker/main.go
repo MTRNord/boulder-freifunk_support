@@ -3,22 +3,22 @@ package main
 import (
 	"crypto/x509"
 	"encoding/json"
+	"flag"
 	"fmt"
-	"io/ioutil"
 	"log/syslog"
 	"os"
 	"reflect"
+	"regexp"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/codegangsta/cli"
 	"github.com/jmhodges/clock"
-	gorp "gopkg.in/gorp.v1"
 
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/core"
+	"github.com/letsencrypt/boulder/features"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
 	"github.com/letsencrypt/boulder/policy"
@@ -33,6 +33,26 @@ const (
 
 	expectedValidityPeriod = time.Hour * 24 * 90
 )
+
+// For defense-in-depth in addition to using the PA & its hostnamePolicy to
+// check domain names we also perform a check against the regex's from the
+// forbiddenDomains array
+var forbiddenDomainPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`^\s*$`),
+	regexp.MustCompile(`\.mil$`),
+	regexp.MustCompile(`\.local$`),
+	regexp.MustCompile(`^localhost$`),
+	regexp.MustCompile(`\.localhost$`),
+}
+
+func isForbiddenDomain(name string) (bool, string) {
+	for _, r := range forbiddenDomainPatterns {
+		if matches := r.FindAllStringSubmatch(name, -1); len(matches) > 0 {
+			return true, r.String()
+		}
+	}
+	return false, ""
+}
 
 var batchSize = 1000
 
@@ -58,9 +78,19 @@ type reportEntry struct {
 	Problems []string `json:"problems,omitempty"`
 }
 
+/*
+ * certDB is an interface collecting the gorp.DbMap functions that the
+ * various parts of cert-checker rely on. Using this adapter shim allows tests to
+ * swap out the dbMap implementation.
+ */
+type certDB interface {
+	Select(i interface{}, query string, args ...interface{}) ([]interface{}, error)
+	SelectOne(holder interface{}, query string, args ...interface{}) error
+}
+
 type certChecker struct {
 	pa           core.PolicyAuthority
-	dbMap        *gorp.DbMap
+	dbMap        certDB
 	certs        chan core.Certificate
 	clock        clock.Clock
 	rMu          *sync.Mutex
@@ -69,7 +99,7 @@ type certChecker struct {
 	stats        metrics.Statter
 }
 
-func newChecker(saDbMap *gorp.DbMap, clk clock.Clock, pa core.PolicyAuthority, period time.Duration) certChecker {
+func newChecker(saDbMap certDB, clk clock.Clock, pa core.PolicyAuthority, period time.Duration) certChecker {
 	c := certChecker{
 		pa:          pa,
 		dbMap:       saDbMap,
@@ -83,11 +113,6 @@ func newChecker(saDbMap *gorp.DbMap, clk clock.Clock, pa core.PolicyAuthority, p
 	return c
 }
 
-const (
-	getCertsCountQuery = "SELECT count(*) FROM certificates WHERE issued >= :issued AND expires >= :now"
-	getCertsQuery      = "SELECT * FROM certificates WHERE issued >= :issued AND expires >= :now AND serial > :lastSerial LIMIT :limit"
-)
-
 func (c *certChecker) getCerts(unexpiredOnly bool) error {
 	c.issuedReport.end = c.clock.Now()
 	c.issuedReport.begin = c.issuedReport.end.Add(-c.checkPeriod)
@@ -100,7 +125,7 @@ func (c *certChecker) getCerts(unexpiredOnly bool) error {
 	var count int
 	err := c.dbMap.SelectOne(
 		&count,
-		getCertsCountQuery,
+		"SELECT count(*) FROM certificates WHERE issued >= :issued AND expires >= :now",
 		args,
 	)
 	if err != nil {
@@ -113,10 +138,9 @@ func (c *certChecker) getCerts(unexpiredOnly bool) error {
 	args["limit"] = batchSize
 	args["lastSerial"] = ""
 	for offset := 0; offset < count; {
-		var certs []core.Certificate
-		_, err = c.dbMap.Select(
-			&certs,
-			getCertsQuery,
+		certs, err := sa.SelectCertificates(
+			c.dbMap,
+			"WHERE issued >= :issued AND expires >= :now AND serial > :lastSerial LIMIT :limit",
 			args,
 		)
 		if err != nil {
@@ -124,6 +148,9 @@ func (c *certChecker) getCerts(unexpiredOnly bool) error {
 		}
 		for _, cert := range certs {
 			c.certs <- cert
+		}
+		if len(certs) == 0 {
+			break
 		}
 		args["lastSerial"] = certs[len(certs)-1].Serial
 		offset += len(certs)
@@ -208,6 +235,16 @@ func (c *certChecker) checkCert(cert core.Certificate) (problems []string) {
 			id := core.AcmeIdentifier{Type: core.IdentifierDNS, Value: name}
 			if err = c.pa.WillingToIssue(id); err != nil {
 				problems = append(problems, fmt.Sprintf("Policy Authority isn't willing to issue for '%s': %s", name, err))
+			} else {
+				// For defense-in-depth, even if the PA was willing to issue for a name
+				// we double check it against a list of forbidden domains. This way even
+				// if the hostnamePolicyFile malfunctions we will flag the forbidden
+				// domain matches
+				if forbidden, pattern := isForbiddenDomain(name); forbidden {
+					problems = append(problems, fmt.Sprintf(
+						"Policy Authority was willing to issue but domain '%s' matches "+
+							"forbiddenDomains entry %q", name, pattern))
+				}
 			}
 		}
 		// Check the cert has the correct key usage extensions
@@ -218,130 +255,116 @@ func (c *certChecker) checkCert(cert core.Certificate) (problems []string) {
 	return problems
 }
 
+type config struct {
+	CertChecker struct {
+		cmd.DBConfig
+		cmd.HostnamePolicyConfig
+
+		Workers             int
+		ReportDirectoryPath string
+		UnexpiredOnly       bool
+		BadResultsOnly      bool
+		CheckPeriod         cmd.ConfigDuration
+
+		Features map[string]bool
+	}
+
+	PA cmd.PAConfig
+
+	Statsd cmd.StatsdConfig
+
+	Syslog cmd.SyslogConfig
+}
+
 func main() {
-	app := cli.NewApp()
-	app.Name = "cert-checker"
-	app.Usage = "Checks validity of issued certificates stored in the database"
-	app.Version = cmd.Version()
-	app.Author = "Boulder contributors"
-	app.Email = "ca-dev@letsencrypt.org"
+	configFile := flag.String("config", "", "File path to the configuration file for this service")
+	workers := flag.Int("workers", runtime.NumCPU(), "The number of concurrent workers used to process certificates")
+	badResultsOnly := flag.Bool("bad-results-only", false, "Only collect and display bad results")
+	connect := flag.String("db-connect", "", "SQL URI if not provided in the configuration file")
+	cp := flag.Duration("check-period", time.Hour*2160, "How far back to check")
+	unexpiredOnly := flag.Bool("unexpired-only", false, "Only check currently unexpired certificates")
 
-	app.Flags = []cli.Flag{
-		cli.IntFlag{
-			Name:  "workers",
-			Value: runtime.NumCPU(),
-			Usage: "The number of concurrent workers used to process certificates",
-		},
-		cli.BoolFlag{
-			Name:  "unexpired-only",
-			Usage: "Only check currently unexpired certificates",
-		},
-		cli.BoolFlag{
-			Name:  "bad-results-only",
-			Usage: "Only collect and display bad results",
-		},
-		cli.StringFlag{
-			Name:  "db-connect",
-			Usage: "SQL URI if not provided in the configuration file",
-		},
-		cli.StringFlag{
-			Name:  "check-period",
-			Value: "2160h",
-			Usage: "How far back to check",
-		},
-		cli.StringFlag{
-			Name:  "config",
-			Value: "config.json",
-			Usage: "Path to configuration file",
-		},
+	flag.Parse()
+	if *configFile == "" {
+		flag.Usage()
+		os.Exit(1)
 	}
 
-	app.Action = func(c *cli.Context) {
-		configPath := c.GlobalString("config")
-		if configPath == "" {
-			fmt.Fprintln(os.Stderr, "--config is required")
-			os.Exit(1)
-		}
-		configBytes, err := ioutil.ReadFile(configPath)
-		cmd.FailOnError(err, "Failed to read config file")
-		var config cmd.Config
-		err = json.Unmarshal(configBytes, &config)
-		cmd.FailOnError(err, "Failed to parse config file")
+	var config config
+	err := cmd.ReadConfigFile(*configFile, &config)
+	cmd.FailOnError(err, "Reading JSON config file into config structure")
 
-		stats, err := metrics.NewStatter(config.Statsd.Server, config.Statsd.Prefix)
-		cmd.FailOnError(err, "Failed to create StatsD client")
-		syslogger, err := syslog.Dial("", "", syslog.LOG_INFO|syslog.LOG_LOCAL0, "")
-		cmd.FailOnError(err, "Failed to dial syslog")
-		logger, err := blog.New(syslogger, 0, 0)
-		cmd.FailOnError(err, "Failed to construct logger")
-		err = blog.Set(logger)
-		cmd.FailOnError(err, "Failed to set audit logger")
+	err = features.Set(config.CertChecker.Features)
+	cmd.FailOnError(err, "Failed to set feature flags")
 
-		if connect := c.GlobalString("db-connect"); connect != "" {
-			config.CertChecker.DBConnect = connect
-		}
-		if workers := c.GlobalInt("workers"); workers != 0 {
-			config.CertChecker.Workers = workers
-		}
-		config.CertChecker.UnexpiredOnly = c.GlobalBool("valid-only")
-		config.CertChecker.BadResultsOnly = c.GlobalBool("bad-results-only")
-		if cp := c.GlobalString("check-period"); cp != "" {
-			config.CertChecker.CheckPeriod.Duration, err = time.ParseDuration(cp)
-			cmd.FailOnError(err, "Failed to parse check period")
-		}
+	stats, err := metrics.NewStatter(config.Statsd.Server, config.Statsd.Prefix)
+	cmd.FailOnError(err, "Failed to create StatsD client")
+	syslogger, err := syslog.Dial("", "", syslog.LOG_INFO|syslog.LOG_LOCAL0, "")
+	cmd.FailOnError(err, "Failed to dial syslog")
+	logger, err := blog.New(syslogger, 0, 0)
+	cmd.FailOnError(err, "Failed to construct logger")
+	err = blog.Set(logger)
+	cmd.FailOnError(err, "Failed to set audit logger")
 
-		// Validate PA config and set defaults if needed
-		cmd.FailOnError(config.PA.CheckChallenges(), "Invalid PA configuration")
+	if *connect != "" {
+		config.CertChecker.DBConnect = *connect
+	}
+	if *workers != 0 {
+		config.CertChecker.Workers = *workers
+	}
+	config.CertChecker.UnexpiredOnly = *unexpiredOnly
+	config.CertChecker.BadResultsOnly = *badResultsOnly
+	config.CertChecker.CheckPeriod.Duration = *cp
 
-		saDbURL, err := config.CertChecker.DBConfig.URL()
-		cmd.FailOnError(err, "Couldn't load DB URL")
-		saDbMap, err := sa.NewDbMap(saDbURL, config.CertChecker.DBConfig.MaxDBConns)
-		cmd.FailOnError(err, "Could not connect to database")
-		go sa.ReportDbConnCount(saDbMap, metrics.NewStatsdScope(stats, "CertChecker"))
+	// Validate PA config and set defaults if needed
+	cmd.FailOnError(config.PA.CheckChallenges(), "Invalid PA configuration")
 
-		pa, err := policy.New(config.PA.Challenges)
-		cmd.FailOnError(err, "Failed to create PA")
-		err = pa.SetHostnamePolicyFile(config.CertChecker.HostnamePolicyFile)
-		cmd.FailOnError(err, "Failed to load HostnamePolicyFile")
+	saDbURL, err := config.CertChecker.DBConfig.URL()
+	cmd.FailOnError(err, "Couldn't load DB URL")
+	saDbMap, err := sa.NewDbMap(saDbURL, config.CertChecker.DBConfig.MaxDBConns)
+	cmd.FailOnError(err, "Could not connect to database")
+	go sa.ReportDbConnCount(saDbMap, metrics.NewStatsdScope(stats, "CertChecker"))
 
-		checker := newChecker(
-			saDbMap,
-			clock.Default(),
-			pa,
-			config.CertChecker.CheckPeriod.Duration,
-		)
-		fmt.Fprintf(os.Stderr, "# Getting certificates issued in the last %s\n", config.CertChecker.CheckPeriod)
+	pa, err := policy.New(config.PA.Challenges)
+	cmd.FailOnError(err, "Failed to create PA")
+	err = pa.SetHostnamePolicyFile(config.CertChecker.HostnamePolicyFile)
+	cmd.FailOnError(err, "Failed to load HostnamePolicyFile")
 
-		// Since we grab certificates in batches we don't want this to block, when it
-		// is finished it will close the certificate channel which allows the range
-		// loops in checker.processCerts to break
+	checker := newChecker(
+		saDbMap,
+		clock.Default(),
+		pa,
+		config.CertChecker.CheckPeriod.Duration,
+	)
+	fmt.Fprintf(os.Stderr, "# Getting certificates issued in the last %s\n", config.CertChecker.CheckPeriod)
+
+	// Since we grab certificates in batches we don't want this to block, when it
+	// is finished it will close the certificate channel which allows the range
+	// loops in checker.processCerts to break
+	go func() {
+		err = checker.getCerts(config.CertChecker.UnexpiredOnly)
+		cmd.FailOnError(err, "Batch retrieval of certificates failed")
+	}()
+
+	fmt.Fprintf(os.Stderr, "# Processing certificates using %d workers\n", config.CertChecker.Workers)
+	wg := new(sync.WaitGroup)
+	for i := 0; i < config.CertChecker.Workers; i++ {
+		wg.Add(1)
 		go func() {
-			err = checker.getCerts(config.CertChecker.UnexpiredOnly)
-			cmd.FailOnError(err, "Batch retrieval of certificates failed")
+			s := checker.clock.Now()
+			checker.processCerts(wg, config.CertChecker.BadResultsOnly)
+			stats.TimingDuration("certChecker.processingLatency", time.Since(s), 1.0)
 		}()
-
-		fmt.Fprintf(os.Stderr, "# Processing certificates using %d workers\n", config.CertChecker.Workers)
-		wg := new(sync.WaitGroup)
-		for i := 0; i < config.CertChecker.Workers; i++ {
-			wg.Add(1)
-			go func() {
-				s := checker.clock.Now()
-				checker.processCerts(wg, config.CertChecker.BadResultsOnly)
-				stats.TimingDuration("certChecker.processingLatency", time.Since(s), 1.0)
-			}()
-		}
-		wg.Wait()
-		fmt.Fprintf(
-			os.Stderr,
-			"# Finished processing certificates, sample: %d, good: %d, bad: %d\n",
-			len(checker.issuedReport.Entries),
-			checker.issuedReport.GoodCerts,
-			checker.issuedReport.BadCerts,
-		)
-		err = checker.issuedReport.dump()
-		cmd.FailOnError(err, "Failed to dump results: %s\n")
 	}
+	wg.Wait()
+	fmt.Fprintf(
+		os.Stderr,
+		"# Finished processing certificates, sample: %d, good: %d, bad: %d\n",
+		len(checker.issuedReport.Entries),
+		checker.issuedReport.GoodCerts,
+		checker.issuedReport.BadCerts,
+	)
+	err = checker.issuedReport.dump()
+	cmd.FailOnError(err, "Failed to dump results: %s\n")
 
-	err := app.Run(os.Args)
-	cmd.FailOnError(err, "Failed to run application")
 }

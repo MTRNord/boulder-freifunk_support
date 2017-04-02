@@ -15,17 +15,14 @@ fi
 
 cd $(dirname $0)
 export SOFTHSM_CONF=$PWD/softhsm.conf
-echo 0:${PWD}/softhsm.db > ${SOFTHSM_CONF}
-softhsm --init-token --slot 0 --label "softhsm token" --pin 1234 --so-pin 1234
-softhsm --slot 0 --import test-ca.key  --label "happy hacker key" --pin 1234 --id FF
-echo "Set SOFTHSM_CONF=${SOFTHSM_CONF} to use, and put in your Boulder config:"
-cat << EOF
-"Key": {
-  "PKCS11": {
-    "Module": "/usr/lib/softhsm/libsofthsm.so",
-    "tokenLabel": "softhsm token",
-    "privateKeyLabel": "happy hacker key",
-    "pin": "1234"
-  }
-},
-EOF
+echo 0:${PWD}/softhsm-slot0.db > ${SOFTHSM_CONF}
+softhsm --slot 0 --init-token --label intermediate --pin 5678 --so-pin 1234
+softhsm --slot 0 --import test-ca.key  --label intermediate_key --pin 5678 --id FB
+echo 1:${PWD}/softhsm-slot1.db >> ${SOFTHSM_CONF}
+softhsm --slot 1 --init-token --label root --pin 5678 --so-pin 1234
+softhsm --slot 1 --import test-root.key  --label root_key --pin 5678 --id FA
+echo
+echo "Add this to your .bashrc:"
+echo "export SOFTHSM_CONF=${SOFTHSM_CONF}"
+echo "And edit test/test-ca.key-pkcs11.json and test/test-root.key-pkcs11.json to have:"
+echo '"module": "/usr/lib/softhsm/libsofthsm.so"'

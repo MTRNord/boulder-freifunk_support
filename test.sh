@@ -18,7 +18,8 @@ HARDFAIL=${HARDFAIL:-fmt godep-restore}
 
 FAILURE=0
 
-TESTPATHS=$(go list -f '{{ .ImportPath }}' ./... | grep -v /vendor/)
+DEFAULT_TESTPATHS=$(go list -f '{{ .ImportPath }}' ./... | grep -v /vendor/)
+TESTPATHS=${TESTPATHS:-$DEFAULT_TESTPATHS}
 
 GITHUB_SECRET_FILE="/tmp/github-secret.json"
 
@@ -52,14 +53,13 @@ function run() {
   return ${status}
 }
 
-function run_and_comment() {
+function run_and_expect_silence() {
   echo "$@"
   result_file=$(mktemp -t bouldertestXXXX)
   "$@" 2>&1 | tee ${result_file}
 
   # Fail if result_file is nonempty.
   if [ -s ${result_file} ]; then
-    echo "[!] FAILURE: $@"
     FAILURE=1
   fi
   rm ${result_file}
@@ -114,7 +114,7 @@ function run_unit_tests() {
 #
 if [[ "$RUN" =~ "vet" ]] ; then
   start_context "vet"
-  run_and_comment go vet ${TESTPATHS}
+  run_and_expect_silence go vet ${TESTPATHS}
   end_context #vet
 fi
 
@@ -142,13 +142,13 @@ if [[ "$RUN" =~ "fmt" ]] ; then
     fi
   }
 
-  run_and_comment check_gofmt
+  run_and_expect_silence check_gofmt
   end_context #fmt
 fi
 
 if [[ "$RUN" =~ "migrations" ]] ; then
   start_context "migrations"
-  run_and_comment ./test/test-no-outdated-migrations.sh
+  run_and_expect_silence ./test/test-no-outdated-migrations.sh
   end_context #"migrations"
 fi
 
@@ -174,27 +174,8 @@ if [[ "$RUN" =~ "integration" ]] ; then
   # Set context to integration, and force a pending state
   start_context "integration"
 
-  if [ -z "$CERTBOT_PATH" ]; then
-    export CERTBOT_PATH=$(mktemp -d -t cbpXXXX)
-    echo "------------------------------------------------"
-    echo "--- Checking out letsencrypt client is slow. ---"
-    echo "--- Recommend setting \$CERTBOT_PATH to  ---"
-    echo "--- client repo with initialized virtualenv  ---"
-    echo "------------------------------------------------"
-    run git clone -b v0.8.0 \
-      https://www.github.com/certbot/certbot.git \
-      $CERTBOT_PATH || exit 1
-  fi
-
-  if ! type certbot >/dev/null 2>/dev/null; then
-    source ${CERTBOT_PATH}/${VENV_NAME:-venv}/bin/activate
-  fi
-
-  python test/integration-test.py --all
-  if [ "$?" != 0 ]; then
-    echo "Integration test failed: $?"
-    FAILURE=1
-  fi
+  source ${CERTBOT_PATH:-/certbot}/${VENV_NAME:-venv}/bin/activate
+  run python test/integration-test.py --chisel
   end_context #integration
 fi
 
@@ -202,13 +183,13 @@ fi
 # Godeps.json really exist in the remote repo and match what we have.
 if [[ "$RUN" =~ "godep-restore" ]] ; then
   start_context "godep-restore"
-  run_and_comment godep restore
+  run_and_expect_silence godep restore
   # Run godep save and do a diff, to ensure that the version we got from
   # `godep restore` matched what was in the remote repo.
   cp Godeps/Godeps.json Godeps/Godeps.json.head
-  run_and_comment godep save ./...
-  run_and_comment diff <(sed /GodepVersion/d Godeps/Godeps.json.head) <(sed /GodepVersion/d Godeps/Godeps.json)
-  run_and_comment git diff --exit-code -- ./vendor/
+  run_and_expect_silence godep save ./...
+  run_and_expect_silence diff <(sed /GodepVersion/d Godeps/Godeps.json.head) <(sed /GodepVersion/d Godeps/Godeps.json)
+  run_and_expect_silence git diff --exit-code -- ./vendor/
   end_context #godep-restore
 fi
 
@@ -221,8 +202,8 @@ fi
 #
 if [[ "$RUN" =~ "errcheck" ]] ; then
   start_context "errcheck"
-  run_and_comment errcheck \
-    -ignore io:Write,os:Remove,net/http:Write,github.com/letsencrypt/boulder/metrics:.*,github.com/cactus/go-statsd-client/statsd:.* \
+  run_and_expect_silence errcheck \
+    -ignore io:Write,os:Remove,net/http:Write,github.com/letsencrypt/boulder/metrics:.*,github.com/letsencrypt/boulder/vendor/github.com/cactus/go-statsd-client/statsd:.* \
     $(echo ${TESTPATHS} | tr ' ' '\n' | grep -v test)
   end_context #errcheck
 fi
@@ -244,9 +225,21 @@ if [[ "$RUN" =~ "generate" ]] ; then
   #     github.com/letsencrypt/boulder/probs)
   go install ./probs
   go install google.golang.org/grpc/codes
-  run_and_comment go generate ${TESTPATHS}
-  run_and_comment git diff --exit-code $(ls | grep -v Godeps)
+  run_and_expect_silence go generate ${TESTPATHS}
+  # Because the `mock` package we use to generate mocks does not properly
+  # support vendored dependencies[0] we are forced to sed out any references to
+  # the vendor directory that sneak into generated resources.
+  # [0] - https://github.com/golang/mock/issues/30
+  goSrcFiles=$(find . -name "*.go" -not -path "./vendor/*" -print)
+  run_and_expect_silence sed -i 's/github.com\/letsencrypt\/boulder\/vendor\///g' ${goSrcFiles}
+  run_and_expect_silence git diff --exit-code $(ls | grep -v Godeps)
   end_context #"generate"
+fi
+
+if [[ "$RUN" =~ "rpm" ]]; then
+  start_context "rpm"
+  run make rpm
+  end_context #"rpm"
 fi
 
 exit ${FAILURE}

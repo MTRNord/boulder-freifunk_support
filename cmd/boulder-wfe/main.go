@@ -1,19 +1,25 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
-	"time"
 
 	"github.com/facebookgo/httpdown"
 	"github.com/jmhodges/clock"
 
 	"github.com/letsencrypt/boulder/cmd"
+	"github.com/letsencrypt/boulder/core"
+	"github.com/letsencrypt/boulder/features"
+	"github.com/letsencrypt/boulder/goodkey"
+	bgrpc "github.com/letsencrypt/boulder/grpc"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics"
+	rapb "github.com/letsencrypt/boulder/ra/proto"
 	"github.com/letsencrypt/boulder/rpc"
+	sapb "github.com/letsencrypt/boulder/sa/proto"
 	"github.com/letsencrypt/boulder/wfe"
 )
 
@@ -22,31 +28,41 @@ const clientName = "WFE"
 type config struct {
 	WFE struct {
 		cmd.ServiceConfig
-		BaseURL       string
-		ListenAddress string
+		BaseURL          string
+		ListenAddress    string
+		TLSListenAddress string
+
+		ServerCertificatePath string
+		ServerKeyPath         string
 
 		AllowOrigins []string
 
-		CertCacheDuration           string
-		CertNoCacheExpirationWindow string
-		IndexCacheDuration          string
-		IssuerCacheDuration         string
+		CertCacheDuration           cmd.ConfigDuration
+		CertNoCacheExpirationWindow cmd.ConfigDuration
+		IndexCacheDuration          cmd.ConfigDuration
+		IssuerCacheDuration         cmd.ConfigDuration
 
-		ShutdownStopTimeout string
-		ShutdownKillTimeout string
+		ShutdownStopTimeout cmd.ConfigDuration
+		ShutdownKillTimeout cmd.ConfigDuration
 
 		SubscriberAgreementURL string
 
-		CheckMalformedCSR bool
+		AcceptRevocationReason bool
+		AllowAuthzDeactivation bool
+
+		TLS cmd.TLSConfig
+
+		RAService *cmd.GRPCClientConfig
+		SAService *cmd.GRPCClientConfig
+
+		Features map[string]bool
 	}
 
-	*cmd.AllowedSigningAlgos
-
-	cmd.StatsdConfig
+	Statsd cmd.StatsdConfig
 
 	SubscriberAgreementURL string
 
-	cmd.SyslogConfig
+	Syslog cmd.SyslogConfig
 
 	Common struct {
 		BaseURL    string
@@ -54,13 +70,37 @@ type config struct {
 	}
 }
 
-func setupWFE(c config, logger blog.Logger, stats metrics.Statter) (*rpc.RegistrationAuthorityClient, *rpc.StorageAuthorityClient) {
+func setupWFE(c config, logger blog.Logger, stats metrics.Scope) (core.RegistrationAuthority, core.StorageAuthority) {
 	amqpConf := c.WFE.AMQP
-	rac, err := rpc.NewRegistrationAuthorityClient(clientName, amqpConf, stats)
-	cmd.FailOnError(err, "Unable to create RA client")
+	var rac core.RegistrationAuthority
 
-	sac, err := rpc.NewStorageAuthorityClient(clientName, amqpConf, stats)
-	cmd.FailOnError(err, "Unable to create SA client")
+	var tls *tls.Config
+	var err error
+	if c.WFE.TLS.CertFile != nil {
+		tls, err = c.WFE.TLS.Load()
+		cmd.FailOnError(err, "TLS config")
+	}
+
+	if c.WFE.RAService != nil {
+		conn, err := bgrpc.ClientSetup(c.WFE.RAService, tls, stats)
+		cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to RA")
+		rac = bgrpc.NewRegistrationAuthorityClient(rapb.NewRegistrationAuthorityClient(conn))
+	} else {
+		var err error
+		rac, err = rpc.NewRegistrationAuthorityClient(clientName, amqpConf, stats)
+		cmd.FailOnError(err, "Unable to create RA AMQP client")
+	}
+
+	var sac core.StorageAuthority
+	if c.WFE.SAService != nil {
+		conn, err := bgrpc.ClientSetup(c.WFE.SAService, tls, stats)
+		cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to SA")
+		sac = bgrpc.NewStorageAuthorityClient(sapb.NewStorageAuthorityClient(conn))
+	} else {
+		var err error
+		sac, err = rpc.NewStorageAuthorityClient(clientName, amqpConf, stats)
+		cmd.FailOnError(err, "Unable to create SA client")
+	}
 
 	return rac, sac
 }
@@ -74,18 +114,20 @@ func main() {
 	}
 
 	var c config
-	err := cmd.ReadJSONFile(*configFile, &c)
+	err := cmd.ReadConfigFile(*configFile, &c)
 	cmd.FailOnError(err, "Reading JSON config file into config structure")
 
-	go cmd.DebugServer(c.WFE.DebugAddr)
+	err = features.Set(c.WFE.Features)
+	cmd.FailOnError(err, "Failed to set feature flags")
 
-	stats, logger := cmd.StatsAndLogging(c.StatsdConfig, c.SyslogConfig)
+	stats, logger := cmd.StatsAndLogging(c.Statsd, c.Syslog)
+	scope := metrics.NewStatsdScope(stats, "WFE")
 	defer logger.AuditPanic()
 	logger.Info(cmd.VersionString(clientName))
 
-	wfe, err := wfe.NewWebFrontEndImpl(stats, clock.Default(), c.AllowedSigningAlgos.KeyPolicy(), logger)
+	wfe, err := wfe.NewWebFrontEndImpl(scope, clock.Default(), goodkey.NewKeyPolicy(), logger)
 	cmd.FailOnError(err, "Unable to create WFE")
-	rac, sac := setupWFE(c, logger, stats)
+	rac, sac := setupWFE(c, logger, scope)
 	wfe.RA = rac
 	wfe.SA = sac
 
@@ -97,35 +139,24 @@ func main() {
 	}
 
 	wfe.AllowOrigins = c.WFE.AllowOrigins
-	wfe.CheckMalformedCSR = c.WFE.CheckMalformedCSR
+	wfe.AcceptRevocationReason = c.WFE.AcceptRevocationReason
+	wfe.AllowAuthzDeactivation = c.WFE.AllowAuthzDeactivation
 
-	wfe.CertCacheDuration, err = time.ParseDuration(c.WFE.CertCacheDuration)
-	cmd.FailOnError(err, "Couldn't parse certificate caching duration")
-	wfe.CertNoCacheExpirationWindow, err = time.ParseDuration(c.WFE.CertNoCacheExpirationWindow)
-	cmd.FailOnError(err, "Couldn't parse certificate expiration no-cache window")
-	wfe.IndexCacheDuration, err = time.ParseDuration(c.WFE.IndexCacheDuration)
-	cmd.FailOnError(err, "Couldn't parse index caching duration")
-	wfe.IssuerCacheDuration, err = time.ParseDuration(c.WFE.IssuerCacheDuration)
-	cmd.FailOnError(err, "Couldn't parse issuer caching duration")
-
-	wfe.ShutdownStopTimeout, err = time.ParseDuration(c.WFE.ShutdownStopTimeout)
-	cmd.FailOnError(err, "Couldn't parse shutdown stop timeout")
-	wfe.ShutdownKillTimeout, err = time.ParseDuration(c.WFE.ShutdownKillTimeout)
-	cmd.FailOnError(err, "Couldn't parse shutdown kill timeout")
+	wfe.CertCacheDuration = c.WFE.CertCacheDuration.Duration
+	wfe.CertNoCacheExpirationWindow = c.WFE.CertNoCacheExpirationWindow.Duration
+	wfe.IndexCacheDuration = c.WFE.IndexCacheDuration.Duration
+	wfe.IssuerCacheDuration = c.WFE.IssuerCacheDuration.Duration
 
 	wfe.IssuerCert, err = cmd.LoadCert(c.Common.IssuerCert)
 	cmd.FailOnError(err, fmt.Sprintf("Couldn't read issuer cert [%s]", c.Common.IssuerCert))
 
-	logger.Info(fmt.Sprintf("WFE using key policy: %#v", c.KeyPolicy()))
-
-	go cmd.ProfileCmd("WFE", stats)
+	logger.Info(fmt.Sprintf("WFE using key policy: %#v", goodkey.NewKeyPolicy()))
 
 	// Set up paths
 	wfe.BaseURL = c.Common.BaseURL
-	h, err := wfe.Handler()
-	cmd.FailOnError(err, "Problem setting up HTTP handlers")
+	h := wfe.Handler()
 
-	httpMonitor := metrics.NewHTTPMonitor(stats, h, "WFE")
+	httpMonitor := metrics.NewHTTPMonitor(scope, h)
 
 	logger.Info(fmt.Sprintf("Server running, listening on %s...\n", c.WFE.ListenAddress))
 	srv := &http.Server{
@@ -133,11 +164,40 @@ func main() {
 		Handler: httpMonitor,
 	}
 
+	go cmd.DebugServer(c.WFE.DebugAddr)
+	go cmd.ProfileCmd(scope)
+
 	hd := &httpdown.HTTP{
-		StopTimeout: wfe.ShutdownStopTimeout,
-		KillTimeout: wfe.ShutdownKillTimeout,
-		Stats:       metrics.NewFBAdapter(stats, "WFE", clock.Default()),
+		StopTimeout: c.WFE.ShutdownStopTimeout.Duration,
+		KillTimeout: c.WFE.ShutdownKillTimeout.Duration,
+		Stats:       metrics.NewFBAdapter(scope, clock.Default()),
 	}
-	err = httpdown.ListenAndServe(srv, hd)
+	hdSrv, err := hd.ListenAndServe(srv)
 	cmd.FailOnError(err, "Error starting HTTP server")
+
+	var hdTLSSrv httpdown.Server
+	if c.WFE.TLSListenAddress != "" {
+		cer, err := tls.LoadX509KeyPair(c.WFE.ServerCertificatePath, c.WFE.ServerKeyPath)
+		cmd.FailOnError(err, "Couldn't read WFE server certificate or key")
+		tlsConfig := &tls.Config{Certificates: []tls.Certificate{cer}}
+
+		logger.Info(fmt.Sprintf("TLS Server running, listening on %s...\n", c.WFE.TLSListenAddress))
+		TLSSrv := &http.Server{
+			Addr:      c.WFE.TLSListenAddress,
+			Handler:   httpMonitor,
+			TLSConfig: tlsConfig,
+		}
+		hdTLSSrv, err = hd.ListenAndServe(TLSSrv)
+		cmd.FailOnError(err, "Error starting TLS server")
+	}
+
+	go cmd.CatchSignals(logger, func() {
+		_ = hdSrv.Stop()
+		if hdTLSSrv != nil {
+			_ = hdTLSSrv.Stop()
+		}
+	})
+
+	forever := make(chan struct{}, 1)
+	<-forever
 }

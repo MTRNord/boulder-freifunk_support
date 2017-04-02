@@ -12,6 +12,7 @@ import (
 	"encoding/asn1"
 	"errors"
 	"math/big"
+	"net/http"
 	"strings"
 	"time"
 
@@ -22,12 +23,6 @@ import (
 	"github.com/cloudflare/cfssl/helpers"
 	"github.com/cloudflare/cfssl/info"
 )
-
-// MaxPathLen is the default path length for a new CA certificate.
-var MaxPathLen = 2
-
-// MaxPathLenZero indicates whether a new CA certificate has pathlen=0
-var MaxPathLenZero = false
 
 // Subject contains the information that should be used to override the
 // subject information when signing a certificate.
@@ -53,13 +48,14 @@ type Extension struct {
 // Extensions requested in the CSR are ignored, except for those processed by
 // ParseCertificateRequest (mainly subjectAltName).
 type SignRequest struct {
-	Hosts      []string    `json:"hosts"`
-	Request    string      `json:"certificate_request"`
-	Subject    *Subject    `json:"subject,omitempty"`
-	Profile    string      `json:"profile"`
-	Label      string      `json:"label"`
-	Serial     *big.Int    `json:"serial,omitempty"`
-	Extensions []Extension `json:"extensions,omitempty"`
+	Hosts       []string    `json:"hosts"`
+	Request     string      `json:"certificate_request"`
+	Subject     *Subject    `json:"subject,omitempty"`
+	Profile     string      `json:"profile"`
+	CRLOverride string      `json:"crl_override"`
+	Label       string      `json:"label"`
+	Serial      *big.Int    `json:"serial,omitempty"`
+	Extensions  []Extension `json:"extensions,omitempty"`
 }
 
 // appendIf appends to a if s is not an empty string.
@@ -104,6 +100,7 @@ type Signer interface {
 	SetPolicy(*config.Signing)
 	SigAlgo() x509.SignatureAlgorithm
 	Sign(req SignRequest) (cert []byte, err error)
+	SetReqModifier(func(*http.Request, []byte))
 }
 
 // Profile gets the specific profile from the signer
@@ -160,26 +157,46 @@ func DefaultSigAlgo(priv crypto.Signer) x509.SignatureAlgorithm {
 // ParseCertificateRequest takes an incoming certificate request and
 // builds a certificate template from it.
 func ParseCertificateRequest(s Signer, csrBytes []byte) (template *x509.Certificate, err error) {
-	csr, err := x509.ParseCertificateRequest(csrBytes)
+	csrv, err := x509.ParseCertificateRequest(csrBytes)
 	if err != nil {
 		err = cferr.Wrap(cferr.CSRError, cferr.ParseFailed, err)
 		return
 	}
 
-	err = helpers.CheckSignature(csr, csr.SignatureAlgorithm, csr.RawTBSCertificateRequest, csr.Signature)
+	err = helpers.CheckSignature(csrv, csrv.SignatureAlgorithm, csrv.RawTBSCertificateRequest, csrv.Signature)
 	if err != nil {
 		err = cferr.Wrap(cferr.CSRError, cferr.KeyMismatch, err)
 		return
 	}
 
 	template = &x509.Certificate{
-		Subject:            csr.Subject,
-		PublicKeyAlgorithm: csr.PublicKeyAlgorithm,
-		PublicKey:          csr.PublicKey,
+		Subject:            csrv.Subject,
+		PublicKeyAlgorithm: csrv.PublicKeyAlgorithm,
+		PublicKey:          csrv.PublicKey,
 		SignatureAlgorithm: s.SigAlgo(),
-		DNSNames:           csr.DNSNames,
-		IPAddresses:        csr.IPAddresses,
-		EmailAddresses:     csr.EmailAddresses,
+		DNSNames:           csrv.DNSNames,
+		IPAddresses:        csrv.IPAddresses,
+		EmailAddresses:     csrv.EmailAddresses,
+	}
+
+	for _, val := range csrv.Extensions {
+		// Check the CSR for the X.509 BasicConstraints (RFC 5280, 4.2.1.9)
+		// extension and append to template if necessary
+		if val.Id.Equal(asn1.ObjectIdentifier{2, 5, 29, 19}) {
+			var constraints csr.BasicConstraints
+			var rest []byte
+
+			if rest, err = asn1.Unmarshal(val.Value, &constraints); err != nil {
+				return nil, cferr.Wrap(cferr.CSRError, cferr.ParseFailed, err)
+			} else if len(rest) != 0 {
+				return nil, cferr.Wrap(cferr.CSRError, cferr.ParseFailed, errors.New("x509: trailing data after X.509 BasicConstraints"))
+			}
+
+			template.BasicConstraintsValid = true
+			template.IsCA = constraints.IsCA
+			template.MaxPathLen = constraints.MaxPathLen
+			template.MaxPathLenZero = template.MaxPathLen == 0
+		}
 	}
 
 	return
@@ -273,7 +290,15 @@ func FillTemplate(template *x509.Certificate, defaultProfile, profile *config.Si
 	template.KeyUsage = ku
 	template.ExtKeyUsage = eku
 	template.BasicConstraintsValid = true
-	template.IsCA = profile.CA
+	template.IsCA = profile.CAConstraint.IsCA
+	if template.IsCA {
+		template.MaxPathLen = profile.CAConstraint.MaxPathLen
+		if template.MaxPathLen == 0 {
+			template.MaxPathLenZero = profile.CAConstraint.MaxPathLenZero
+		}
+		template.DNSNames = nil
+		template.EmailAddresses = nil
+	}
 	template.SubjectKeyId = ski
 
 	if ocspURL != "" {

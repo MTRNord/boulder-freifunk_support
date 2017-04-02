@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/letsencrypt/boulder/probs"
 	"github.com/miekg/dns"
 	"golang.org/x/net/context"
 )
@@ -27,6 +26,8 @@ func (d DNSError) Error() string {
 			} else {
 				detail = detailDNSNetFailure
 			}
+			// Note: we check d.underlying here even though `Timeout()` does this because the call to `netErr.Timeout()` above only
+			// happens for `*net.OpError` underlying types!
 		} else if d.underlying == context.Canceled || d.underlying == context.DeadlineExceeded {
 			detail = detailDNSTimeout
 		} else {
@@ -45,6 +46,8 @@ func (d DNSError) Error() string {
 func (d DNSError) Timeout() bool {
 	if netErr, ok := d.underlying.(*net.OpError); ok {
 		return netErr.Timeout()
+	} else if d.underlying == context.Canceled || d.underlying == context.DeadlineExceeded {
+		return true
 	}
 	return false
 }
@@ -52,15 +55,3 @@ func (d DNSError) Timeout() bool {
 const detailDNSTimeout = "query timed out"
 const detailDNSNetFailure = "networking error"
 const detailServerFailure = "server failure at resolver"
-
-// ProblemDetailsFromDNSError checks the error returned from Lookup...  methods
-// and tests if the error was an underlying net.OpError or an error caused by
-// resolver returning SERVFAIL or other invalid Rcodes and returns the relevant
-// core.ProblemDetails. The detail string will contain a mention of the DNS
-// record type and domain given.
-func ProblemDetailsFromDNSError(err error) *probs.ProblemDetails {
-	if dnsErr, ok := err.(*DNSError); ok {
-		return probs.ConnectionFailure(dnsErr.Error())
-	}
-	return probs.ConnectionFailure(detailServerFailure)
-}

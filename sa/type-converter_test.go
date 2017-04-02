@@ -7,7 +7,7 @@ import (
 	"github.com/letsencrypt/boulder/core"
 	"github.com/letsencrypt/boulder/test"
 
-	jose "github.com/square/go-jose"
+	jose "gopkg.in/square/go-jose.v1"
 )
 
 const JWK1JSON = `{
@@ -34,6 +34,7 @@ func TestAcmeIdentifier(t *testing.T) {
 
 	marshaled := marshaledI.(string)
 	err = scanner.Binder(&marshaled, &out)
+	test.AssertNotError(t, err, "failed to scanner.Binder")
 	test.AssertMarshaledEquals(t, ai, out)
 }
 
@@ -58,6 +59,7 @@ func TestJsonWebKey(t *testing.T) {
 
 	marshaled := marshaledI.(string)
 	err = scanner.Binder(&marshaled, &out)
+	test.AssertNotError(t, err, "failed to scanner.Binder")
 	test.AssertMarshaledEquals(t, jwk, out)
 }
 
@@ -79,6 +81,7 @@ func TestAcmeStatus(t *testing.T) {
 
 	marshaled := marshaledI.(string)
 	err = scanner.Binder(&marshaled, &out)
+	test.AssertNotError(t, err, "failed to scanner.Binder")
 	test.AssertMarshaledEquals(t, as, out)
 }
 
@@ -100,12 +103,13 @@ func TestOCSPStatus(t *testing.T) {
 
 	marshaled := marshaledI.(string)
 	err = scanner.Binder(&marshaled, &out)
+	test.AssertNotError(t, err, "failed to scanner.Binder")
 	test.AssertMarshaledEquals(t, os, out)
 }
 
-func TestAcmeURLSlice(t *testing.T) {
+func TestStringSlice(t *testing.T) {
 	tc := BoulderTypeConverter{}
-	var au, out []*core.AcmeURL
+	var au, out []string
 
 	marshaledI, err := tc.ToDb(au)
 	test.AssertNotError(t, err, "Could not ToDb")
@@ -119,5 +123,6 @@ func TestAcmeURLSlice(t *testing.T) {
 
 	marshaled := marshaledI.(string)
 	err = scanner.Binder(&marshaled, &out)
+	test.AssertNotError(t, err, "failed to scanner.Binder")
 	test.AssertMarshaledEquals(t, au, out)
 }

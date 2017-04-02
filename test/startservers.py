@@ -11,27 +11,11 @@ import tempfile
 import threading
 import time
 
-# TODO: remove default_config once all binaries have been migrated from the global config
-default_config = os.environ.get('BOULDER_CONFIG', '')
-if default_config == '':
-    default_config = 'test/boulder-config.json'
-
 default_config_dir = os.environ.get('BOULDER_CONFIG_DIR', '')
 if default_config_dir == '':
     default_config_dir = 'test/config'
 
 processes = []
-
-def get_config(service):
-    """
-    Returns the path to the configuration file for a service, if it does not
-    exist, it return a path to the default config files, which will
-    eventually be removed completely
-    """
-    path = os.path.join(default_config_dir, service + ".json")
-    if os.path.exists(path):
-        return path
-    return default_config
 
 def install(race_detection):
     # Pass empty BUILD_TIME and BUILD_ID flags to avoid constantly invalidating the
@@ -44,9 +28,11 @@ def install(race_detection):
     return subprocess.call(cmd, shell=True) == 0
 
 def run(cmd, race_detection):
+    e = os.environ.copy()
+    e.setdefault("GORACE", "halt_on_error=1")
     # Note: Must use exec here so that killing this process kills the command.
-    cmd = """GORACE="halt_on_error=1" exec ./bin/%s""" % cmd
-    p = subprocess.Popen(cmd, shell=True)
+    cmd = """exec ./bin/%s""" % cmd
+    p = subprocess.Popen(cmd, shell=True, env=e)
     p.cmd = cmd
     return p
 
@@ -57,22 +43,25 @@ def start(race_detection):
     startup. Anything that did start before this point can be cleaned
     up explicitly by calling stop(), or automatically atexit.
     """
+    signal.signal(signal.SIGTERM, lambda _, __: stop())
+    signal.signal(signal.SIGINT, lambda _, __: stop())
     global processes
     forward()
     progs = [
-        'boulder-wfe --config %s' % get_config('wfe'),
-        'boulder-ra --config %s' % get_config('ra'),
-        'boulder-sa --config %s' % get_config('sa'),
-        'boulder-ca --config %s' % get_config('ca'),
-        'boulder-va --config %s' % get_config('va'),
-        'boulder-publisher --config %s' % get_config('publisher'),
-        'ocsp-updater --config %s' % get_config('ocsp-updater'),
-        'ocsp-responder --config %s' % get_config('ocsp-responder'),
-        'ct-test-srv --config %s' % get_config('ct-test-srv'),
-        'dns-test-srv --config %s' % get_config('dns-test-srv'),
-        'mail-test-srv --config %s' % get_config('mail-test-srv'),
-        'ocsp-responder --config test/issuer-ocsp-responder.json',
-        'caa-checker --config cmd/caa-checker/test-config.yml'
+        # The gsb-test-srv needs to be started before the VA or its intial DB
+        # update will fail and all subsequent lookups will be invalid
+        'gsb-test-srv -apikey my-voice-is-my-passport',
+        'boulder-sa --config %s' % os.path.join(default_config_dir, "sa.json"),
+        'boulder-wfe --config %s' % os.path.join(default_config_dir, "wfe.json"),
+        'boulder-ra --config %s' % os.path.join(default_config_dir, "ra.json"),
+        'boulder-ca --config %s' % os.path.join(default_config_dir, "ca.json"),
+        'boulder-va --config %s' % os.path.join(default_config_dir, "va.json"),
+        'boulder-publisher --config %s' % os.path.join(default_config_dir, "publisher.json"),
+        'ocsp-updater --config %s' % os.path.join(default_config_dir, "ocsp-updater.json"),
+        'ocsp-responder --config %s' % os.path.join(default_config_dir, "ocsp-responder.json"),
+        'ct-test-srv',
+        'dns-test-srv',
+        'mail-test-srv --closeFirst 5'
     ]
     if not install(race_detection):
         return False
@@ -94,7 +83,7 @@ def start(race_detection):
             # If one of the servers has died, quit immediately.
             if not check():
                 return False
-            ports = range(8000, 8005) + [4000]
+            ports = range(8000, 8005) + [4000, 4430]
             for debug_port in ports:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.connect(('localhost', debug_port))
@@ -149,6 +138,14 @@ def check():
 
 @atexit.register
 def stop():
+    # When we are about to exit, send SIGKILL to each subprocess and wait for
+    # them to nicely die. This reflects the restart process in prod and allows
+    # us to exercise the graceful shutdown code paths.
+    # TODO(jsha): Switch to SIGTERM once we fix
+    # https://github.com/letsencrypt/boulder/issues/2410 and remove AMQP, to
+    # make shutdown less noisy.
     for p in processes:
         if p.poll() is None:
-            p.kill()
+            p.send_signal(signal.SIGKILL)
+    for p in processes:
+        p.wait()

@@ -1,13 +1,13 @@
 package core
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"expvar"
@@ -16,17 +16,15 @@ import (
 	"io/ioutil"
 	"math/big"
 	mrand "math/rand"
-	"net/http"
-	"net/url"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
 	"unicode"
 
+	jose "gopkg.in/square/go-jose.v1"
+
 	blog "github.com/letsencrypt/boulder/log"
-	"github.com/letsencrypt/boulder/probs"
-	jose "github.com/square/go-jose"
 )
 
 // Package Variables Variables
@@ -101,47 +99,6 @@ func (e RateLimitedError) Error() string         { return string(e) }
 func (e TooManyRPCRequestsError) Error() string  { return string(e) }
 func (e BadNonceError) Error() string            { return string(e) }
 
-// statusTooManyRequests is the HTTP status code meant for rate limiting
-// errors. It's not currently in the net/http library so we add it here.
-const statusTooManyRequests = 429
-
-// ProblemDetailsForError turns an error into a ProblemDetails with the special
-// case of returning the same error back if its already a ProblemDetails. If the
-// error is of an type unknown to ProblemDetailsForError, it will return a
-// ServerInternal ProblemDetails.
-func ProblemDetailsForError(err error, msg string) *probs.ProblemDetails {
-	switch e := err.(type) {
-	case *probs.ProblemDetails:
-		return e
-	case MalformedRequestError:
-		return probs.Malformed(fmt.Sprintf("%s :: %s", msg, err))
-	case NotSupportedError:
-		return &probs.ProblemDetails{
-			Type:       probs.ServerInternalProblem,
-			Detail:     fmt.Sprintf("%s :: %s", msg, err),
-			HTTPStatus: http.StatusNotImplemented,
-		}
-	case UnauthorizedError:
-		return probs.Unauthorized(fmt.Sprintf("%s :: %s", msg, err))
-	case NotFoundError:
-		return probs.NotFound(fmt.Sprintf("%s :: %s", msg, err))
-	case LengthRequiredError:
-		prob := probs.Malformed("missing Content-Length header")
-		prob.HTTPStatus = http.StatusLengthRequired
-		return prob
-	case SignatureValidationError:
-		return probs.Malformed(fmt.Sprintf("%s :: %s", msg, err))
-	case RateLimitedError:
-		return probs.RateLimited(fmt.Sprintf("%s :: %s", msg, err))
-	case BadNonceError:
-		return probs.BadNonce(fmt.Sprintf("%s :: %s", msg, err))
-	default:
-		// Internal server error messages may include sensitive data, so we do
-		// not include it.
-		return probs.ServerInternal(msg)
-	}
-}
-
 // Random stuff
 
 // RandomString returns a randomly generated string of the requested length.
@@ -212,50 +169,21 @@ func KeyDigestEquals(j, k crypto.PublicKey) bool {
 	return digestJ == digestK
 }
 
-// AcmeURL is a URL that automatically marshal/unmarshal to JSON strings
-type AcmeURL url.URL
-
-// ParseAcmeURL is just a wrapper around url.Parse that returns an *AcmeURL
-func ParseAcmeURL(s string) (*AcmeURL, error) {
-	u, err := url.Parse(s)
+// PublicKeysEqual determines whether two public keys have the same marshalled
+// bytes as one another
+func PublicKeysEqual(a, b interface{}) (bool, error) {
+	if a == nil || b == nil {
+		return false, errors.New("One or more nil arguments to PublicKeysEqual")
+	}
+	aBytes, err := x509.MarshalPKIXPublicKey(a)
 	if err != nil {
-		return nil, err
+		return false, err
 	}
-	return (*AcmeURL)(u), nil
-}
-
-func (u *AcmeURL) String() string {
-	uu := (*url.URL)(u)
-	return uu.String()
-}
-
-// PathSegments splits an AcmeURL into segments on the '/' characters
-func (u *AcmeURL) PathSegments() (segments []string) {
-	segments = strings.Split(u.Path, "/")
-	if len(segments) > 0 && len(segments[0]) == 0 {
-		segments = segments[1:]
-	}
-	return
-}
-
-// MarshalJSON encodes an AcmeURL for transfer
-func (u *AcmeURL) MarshalJSON() ([]byte, error) {
-	return json.Marshal(u.String())
-}
-
-// UnmarshalJSON decodes an AcmeURL from transfer
-func (u *AcmeURL) UnmarshalJSON(data []byte) error {
-	var str string
-	if err := json.Unmarshal(data, &str); err != nil {
-		return err
-	}
-
-	uu, err := url.Parse(str)
+	bBytes, err := x509.MarshalPKIXPublicKey(b)
 	if err != nil {
-		return err
+		return false, err
 	}
-	*u = AcmeURL(*uu)
-	return nil
+	return bytes.Compare(aBytes, bBytes) == 0, nil
 }
 
 // SerialToString converts a certificate serial number (big.Int) to a String

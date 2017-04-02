@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/mail"
 	"net/smtp"
+	"net/textproto"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/letsencrypt/boulder/core"
 	blog "github.com/letsencrypt/boulder/log"
+	"github.com/letsencrypt/boulder/metrics"
 )
 
 type idGenerator interface {
@@ -49,11 +51,15 @@ type Mailer interface {
 // MailerImpl defines a mail transfer agent to use for sending mail. It is not
 // safe for concurrent access.
 type MailerImpl struct {
-	dialer      dialer
-	from        mail.Address
-	client      smtpClient
-	clk         clock.Clock
-	csprgSource idGenerator
+	log           blog.Logger
+	dialer        dialer
+	from          mail.Address
+	client        smtpClient
+	clk           clock.Clock
+	csprgSource   idGenerator
+	stats         metrics.Scope
+	reconnectBase time.Duration
+	reconnectMax  time.Duration
 }
 
 type dialer interface {
@@ -100,7 +106,16 @@ func (d dryRunClient) Write(p []byte) (n int, err error) {
 
 // New constructs a Mailer to represent an account on a particular mail
 // transfer agent.
-func New(server, port, username, password string, from mail.Address) *MailerImpl {
+func New(
+	server,
+	port,
+	username,
+	password string,
+	from mail.Address,
+	logger blog.Logger,
+	stats metrics.Scope,
+	reconnectBase time.Duration,
+	reconnectMax time.Duration) *MailerImpl {
 	return &MailerImpl{
 		dialer: &dialerImpl{
 			username: username,
@@ -108,20 +123,26 @@ func New(server, port, username, password string, from mail.Address) *MailerImpl
 			server:   server,
 			port:     port,
 		},
-		from:        from,
-		clk:         clock.Default(),
-		csprgSource: realSource{},
+		log:           logger,
+		from:          from,
+		clk:           clock.Default(),
+		csprgSource:   realSource{},
+		stats:         stats.NewScope("Mailer"),
+		reconnectBase: reconnectBase,
+		reconnectMax:  reconnectMax,
 	}
 }
 
 // New constructs a Mailer suitable for doing a dry run. It simply logs each
 // command that would have been run, at debug level.
 func NewDryRun(from mail.Address, logger blog.Logger) *MailerImpl {
+	stats := metrics.NewNoopScope()
 	return &MailerImpl{
 		dialer:      dryRunClient{logger},
 		from:        from,
 		clk:         clock.Default(),
 		csprgSource: realSource{},
+		stats:       stats,
 	}
 }
 
@@ -166,6 +187,22 @@ func (m *MailerImpl) generateMessage(to []string, subject, body string) ([]byte,
 	)), nil
 }
 
+func (m *MailerImpl) reconnect() {
+	for i := 0; ; i++ {
+		sleepDuration := core.RetryBackoff(i, m.reconnectBase, m.reconnectMax, 2)
+		m.log.Info(fmt.Sprintf("sleeping for %s before reconnecting mailer", sleepDuration))
+		m.clk.Sleep(sleepDuration)
+		m.log.Info("attempting to reconnect mailer")
+		err := m.Connect()
+		if err != nil {
+			m.log.Warning(fmt.Sprintf("reconnect error: %s", err))
+			continue
+		}
+		break
+	}
+	m.log.Info("reconnected successfully")
+}
+
 // Connect opens a connection to the specified mail server. It must be called
 // before SendMail.
 func (m *MailerImpl) Connect() error {
@@ -206,9 +243,7 @@ func (di *dialerImpl) Dial() (smtpClient, error) {
 	return client, nil
 }
 
-// SendMail sends an email to the provided list of recipients. The email body
-// is simple text.
-func (m *MailerImpl) SendMail(to []string, subject, msg string) error {
+func (m *MailerImpl) sendOne(to []string, subject, msg string) error {
 	if m.client == nil {
 		return errors.New("call Connect before SendMail")
 	}
@@ -228,16 +263,65 @@ func (m *MailerImpl) SendMail(to []string, subject, msg string) error {
 	if err != nil {
 		return err
 	}
-
 	_, err = w.Write(body)
 	if err != nil {
 		return err
 	}
-
 	err = w.Close()
 	if err != nil {
 		return err
 	}
+	return nil
+}
+
+// SendMail sends an email to the provided list of recipients. The email body
+// is simple text.
+func (m *MailerImpl) SendMail(to []string, subject, msg string) error {
+	m.stats.Inc("SendMail.Attempts", 1)
+
+	for {
+		err := m.sendOne(to, subject, msg)
+		if err == nil {
+			// If the error is nil, we sent the mail without issue. nice!
+			break
+		} else if err == io.EOF {
+			// If the error is an EOF, we should try to reconnect on a backoff
+			// schedule, sleeping between attempts.
+			m.stats.Inc("SendMail.Errors.EOF", 1)
+			m.reconnect()
+			// After reconnecting, loop around and try `sendOne` again.
+			m.stats.Inc("SendMail.Reconnects", 1)
+			continue
+		} else if err != nil {
+			/*
+			 *  If the error is an instance of `textproto.Error` with a SMTP error code,
+			 *  and that error code is 421 then treat this as a reconnect-able event.
+			 *
+			 *  The SMTP RFC defines this error code as:
+			 *   421 <domain> Service not available, closing transmission channel
+			 *   (This may be a reply to any command if the service knows it
+			 *   must shut down)
+			 *
+			 * In practice we see this code being used by our production SMTP server
+			 * when the connection has gone idle for too long. For more information
+			 * see issue #2249[0].
+			 *
+			 * [0] - https://github.com/letsencrypt/boulder/issues/2249
+			 */
+			if protoErr, ok := err.(*textproto.Error); ok && protoErr.Code == 421 {
+				m.stats.Inc("SendMail.Errors.SMTP.421", 1)
+				m.reconnect()
+				m.stats.Inc("SendMail.Reconnects", 1)
+			} else {
+				// If it wasn't an EOF error or a SMTP 421 it is unexpected and we
+				// return from SendMail() with an error
+				m.stats.Inc("SendMail.Errors", 1)
+				return err
+			}
+		}
+	}
+
+	m.stats.Inc("SendMail.Successes", 1)
 	return nil
 }
 

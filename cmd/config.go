@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,132 +14,7 @@ import (
 	"github.com/letsencrypt/pkcs11key"
 
 	"github.com/letsencrypt/boulder/core"
-	"github.com/letsencrypt/boulder/goodkey"
 )
-
-// Config stores configuration parameters that applications
-// will need.  For simplicity, we just lump them all into
-// one struct, and use encoding/json to read it from a file.
-//
-// Note: NO DEFAULTS are provided.
-type Config struct {
-	// Default AMQPConfig for services that don't specify one.
-	// TODO(jsha): Delete this after a deploy.
-	AMQP *AMQPConfig
-
-	Statsd StatsdConfig
-
-	Syslog SyslogConfig
-
-	Revoker struct {
-		DBConfig
-		// The revoker isn't a long running service, so doesn't get a full
-		// ServiceConfig, just an AMQPConfig.
-		AMQP *AMQPConfig
-	}
-
-	Mailer struct {
-		ServiceConfig
-		DBConfig
-		SMTPConfig
-
-		From    string
-		Subject string
-
-		CertLimit int
-		NagTimes  []string
-		// How much earlier (than configured nag intervals) to
-		// send reminders, to account for the expected delay
-		// before the next expiration-mailer invocation.
-		NagCheckInterval string
-		// Path to a text/template email template
-		EmailTemplate string
-	}
-
-	OCSPResponder struct {
-		ServiceConfig
-		DBConfig
-
-		// Source indicates the source of pre-signed OCSP responses to be used. It
-		// can be a DBConnect string or a file URL. The file URL style is used
-		// when responding from a static file for intermediates and roots.
-		// If DBConfig has non-empty fields, it takes precedence over this.
-		Source string
-
-		Path          string
-		ListenAddress string
-		// MaxAge is the max-age to set in the Cache-Control response
-		// header. It is a time.Duration formatted string.
-		MaxAge ConfigDuration
-
-		ShutdownStopTimeout string
-		ShutdownKillTimeout string
-	}
-
-	OCSPUpdater OCSPUpdaterConfig
-
-	Publisher struct {
-		ServiceConfig
-		SubmissionTimeout              ConfigDuration
-		MaxConcurrentRPCServerRequests int64
-	}
-
-	PA PAConfig
-
-	Common struct {
-		BaseURL string
-		// Path to a PEM-encoded copy of the issuer certificate.
-		IssuerCert string
-
-		DNSResolver               string
-		DNSTimeout                string
-		DNSAllowLoopbackAddresses bool
-
-		CT struct {
-			Logs                       []LogDescription
-			IntermediateBundleFilename string
-		}
-	}
-
-	CertChecker struct {
-		DBConfig
-		HostnamePolicyConfig
-
-		Workers             int
-		ReportDirectoryPath string
-		UnexpiredOnly       bool
-		BadResultsOnly      bool
-		CheckPeriod         ConfigDuration
-	}
-	AllowedSigningAlgos *AllowedSigningAlgos
-
-	// TODO: remove after production configs use SubscriberAgreementURL in the wfe section
-	SubscriberAgreementURL string
-}
-
-// AllowedSigningAlgos defines which algorithms be used for keys that we will
-// sign.
-type AllowedSigningAlgos struct {
-	RSA           bool
-	ECDSANISTP256 bool
-	ECDSANISTP384 bool
-	ECDSANISTP521 bool
-}
-
-// KeyPolicy returns a KeyPolicy reflecting the Boulder configuration.
-func (asa *AllowedSigningAlgos) KeyPolicy() goodkey.KeyPolicy {
-	if asa != nil {
-		return goodkey.KeyPolicy{
-			AllowRSA:           asa.RSA,
-			AllowECDSANISTP256: asa.ECDSANISTP256,
-			AllowECDSANISTP384: asa.ECDSANISTP384,
-			AllowECDSANISTP521: asa.ECDSANISTP521,
-		}
-	}
-	return goodkey.KeyPolicy{
-		AllowRSA: true,
-	}
-}
 
 // PasswordConfig either contains a password or the path to a file
 // containing a password
@@ -166,6 +43,7 @@ type ServiceConfig struct {
 	DebugAddr string
 	AMQP      *AMQPConfig
 	GRPC      *GRPCServerConfig
+	TLS       TLSConfig
 }
 
 // DBConfig defines how to connect to a database. The connect string may be
@@ -179,11 +57,12 @@ type DBConfig struct {
 }
 
 // URL returns the DBConnect URL represented by this DBConfig object, either
-// loading it from disk or returning a default value.
+// loading it from disk or returning a default value. Leading and trailing
+// whitespace is stripped.
 func (d *DBConfig) URL() (string, error) {
 	if d.DBConnectFile != "" {
 		url, err := ioutil.ReadFile(d.DBConnectFile)
-		return string(url), err
+		return strings.TrimSpace(string(url)), err
 	}
 	return d.DBConnect, nil
 }
@@ -240,6 +119,9 @@ type CAConfig struct {
 	DBConfig
 	HostnamePolicyConfig
 
+	GRPCCA            *GRPCServerConfig
+	GRPCOCSPGenerator *GRPCServerConfig
+
 	RSAProfile   string
 	ECDSAProfile string
 	TestMode     bool
@@ -270,7 +152,9 @@ type CAConfig struct {
 	// triggers issuance of certificates with Must Staple.
 	EnableMustStaple bool
 
-	PublisherService *GRPCClientConfig
+	SAService *GRPCClientConfig
+
+	Features map[string]bool
 }
 
 // PAConfig specifies how a policy authority should connect to its
@@ -311,13 +195,49 @@ type IssuerConfig struct {
 	File       string
 	PKCS11     *pkcs11key.Config
 	CertFile   string
+	// Number of sessions to open with the HSM. For maximum performance,
+	// this should be equal to the number of cores in the HSM. Defaults to 1.
+	NumSessions int
 }
 
-// TLSConfig reprents certificates and a key for authenticated TLS.
+// TLSConfig represents certificates and a key for authenticated TLS.
 type TLSConfig struct {
 	CertFile   *string
 	KeyFile    *string
 	CACertFile *string
+}
+
+// Load reads and parses the certificates and key listed in the TLSConfig, and
+// returns a *tls.Config suitable for either client or server use.
+func (t TLSConfig) Load() (*tls.Config, error) {
+	if t.CertFile == nil {
+		return nil, fmt.Errorf("nil CertFile in TLSConfig")
+	}
+	if t.KeyFile == nil {
+		return nil, fmt.Errorf("nil KeyFile in TLSConfig")
+	}
+	if t.CACertFile == nil {
+		return nil, fmt.Errorf("nil CACertFile in TLSConfig")
+	}
+	caCertBytes, err := ioutil.ReadFile(*t.CACertFile)
+	if err != nil {
+		return nil, fmt.Errorf("reading CA cert from %q: %s", *t.CACertFile, err)
+	}
+	rootCAs := x509.NewCertPool()
+	if ok := rootCAs.AppendCertsFromPEM(caCertBytes); !ok {
+		return nil, fmt.Errorf("parsing CA certs from %s failed", *t.CACertFile)
+	}
+	cert, err := tls.LoadX509KeyPair(*t.CertFile, *t.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("loading key pair from %q and %q: %s",
+			*t.CertFile, *t.KeyFile, err)
+	}
+	return &tls.Config{
+		RootCAs:      rootCAs,
+		ClientCAs:    rootCAs,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		Certificates: []tls.Certificate{cert},
+	}, nil
 }
 
 // RPCServerConfig contains configuration particular to a specific RPC server
@@ -343,8 +263,10 @@ type OCSPUpdaterConfig struct {
 	MissingSCTBatchSize         int
 	RevokedCertificateBatchSize int
 
-	OCSPMinTimeToExpiry ConfigDuration
-	OldestIssuedSCT     ConfigDuration
+	OCSPMinTimeToExpiry          ConfigDuration
+	OCSPStaleMaxAge              ConfigDuration
+	OldestIssuedSCT              ConfigDuration
+	ParallelGenerateOCSPRequests int
 
 	AkamaiBaseURL           string
 	AkamaiClientToken       string
@@ -356,14 +278,19 @@ type OCSPUpdaterConfig struct {
 	SignFailureBackoffFactor float64
 	SignFailureBackoffMax    ConfigDuration
 
-	Publisher *GRPCClientConfig
+	Publisher            *GRPCClientConfig
+	SAService            *GRPCClientConfig
+	OCSPGeneratorService *GRPCClientConfig
+
+	Features map[string]bool
 }
 
 // GoogleSafeBrowsingConfig is the JSON config struct for the VA's use of the
 // Google Safe Browsing API.
 type GoogleSafeBrowsingConfig struct {
-	APIKey  string
-	DataDir string
+	APIKey    string
+	DataDir   string
+	ServerURL string
 }
 
 // SyslogConfig defines the config for syslogging.
@@ -435,19 +362,25 @@ type LogDescription struct {
 
 // GRPCClientConfig contains the information needed to talk to the gRPC service
 type GRPCClientConfig struct {
-	ServerAddresses       []string
+	ServerAddresses []string
+	Timeout         ConfigDuration
+	// Deprecated. Use TLSConfig instead. TODO(#2472): Delete these.
 	ServerIssuerPath      string
 	ClientCertificatePath string
 	ClientKeyPath         string
-	Timeout               ConfigDuration
 }
 
 // GRPCServerConfig contains the information needed to run a gRPC service
 type GRPCServerConfig struct {
-	Address               string `json:"address" yaml:"address"`
-	ServerCertificatePath string `json:"serverCertificatePath" yaml:"server-certificate-path"`
-	ServerKeyPath         string `json:"serverKeyPath" yaml:"server-key-path"`
-	ClientIssuerPath      string `json:"clientIssuerPath" yaml:"client-issuer-path"`
+	Address string `json:"address"`
+	// ClientNames is a list of allowed client certificate subject alternate names
+	// (SANs). The server will reject clients that do not present a certificate
+	// with a SAN present on the `ClientNames` list.
+	ClientNames []string `json:"clientNames"`
+	// Deprecated. Use TLSConfig instead. TODO(#2472): Delete these.
+	ServerCertificatePath string `json:"serverCertificatePath"`
+	ServerKeyPath         string `json:"serverKeyPath"`
+	ClientIssuerPath      string `json:"clientIssuerPath"`
 }
 
 // PortConfig specifies what ports the VA should call to on the remote

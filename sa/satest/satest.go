@@ -9,7 +9,7 @@ import (
 	"golang.org/x/net/context"
 
 	"github.com/letsencrypt/boulder/core"
-	jose "github.com/square/go-jose"
+	jose "gopkg.in/square/go-jose.v1"
 )
 
 var theKey = `{
@@ -24,13 +24,13 @@ var theKey = `{
 // SQLSAImpl. Long term, when the CA tests no longer need
 // CreateWorkingRegistration, this and CreateWorkingRegistration can
 // be pushed back into the SA tests proper.
-func GoodJWK() jose.JsonWebKey {
+func GoodJWK() *jose.JsonWebKey {
 	var jwk jose.JsonWebKey
 	err := json.Unmarshal([]byte(theKey), &jwk)
 	if err != nil {
 		panic("known-good theKey is no longer known-good")
 	}
-	return jwk
+	return &jwk
 }
 
 // CreateWorkingRegistration inserts a new, correct Registration into
@@ -40,16 +40,14 @@ func GoodJWK() jose.JsonWebKey {
 // CreateWorkingRegistration, this and CreateWorkingRegistration can
 // be pushed back into the SA tests proper.
 func CreateWorkingRegistration(t *testing.T, sa core.StorageAdder) core.Registration {
-	contact, err := core.ParseAcmeURL("mailto:foo@example.com")
-	if err != nil {
-		t.Fatalf("unable to parse contact link: %s", err)
-	}
-	contacts := &[]*core.AcmeURL{contact}
+	contact := "mailto:foo@example.com"
+	contacts := &[]string{contact}
 	reg, err := sa.NewRegistration(context.Background(), core.Registration{
 		Key:       GoodJWK(),
 		Contact:   contacts,
 		InitialIP: net.ParseIP("88.77.66.11"),
 		CreatedAt: time.Date(2003, 5, 10, 0, 0, 0, 0, time.UTC),
+		Status:    core.StatusValid,
 	})
 	if err != nil {
 		t.Fatalf("Unable to create new registration: %s", err)
