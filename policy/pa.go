@@ -324,7 +324,7 @@ func extractDomainIANASuffix(name string) (string, error) {
 
 	rule := publicsuffix.DefaultList.Find(name, &publicsuffix.FindOptions{IgnorePrivate: true, DefaultRule: nil})
 	if rule == nil {
-		return "", fmt.Errorf("Domain %s has no IANA TLD", name)
+		return name, fmt.Errorf("Domain %s has no IANA TLD", name)
 	}
 
 	suffix := rule.Decompose(name)[1]
