@@ -325,8 +325,9 @@ func extractDomainIANASuffix(name string) (string, error) {
 	rule := publicsuffix.DefaultList.Find(name, &publicsuffix.FindOptions{IgnorePrivate: true, DefaultRule: nil})
 	
 	suffix := ""
-	
-	suffix2 := rule.Decompose(name)[1]
+	if rule != nil {
+		suffix2 := rule.Decompose(name)[1]
+	}
 	
 	if rule == nil {
 		sliced := strings.Split(name, ".")
