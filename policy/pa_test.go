@@ -86,11 +86,6 @@ func TestWillingToIssue(t *testing.T) {
 
 		// disallow capitalized letters for #927
 		{`CapitalizedLetters.com`, errInvalidDNSCharacter},
-
-		{`example.acting`, errNonPublic},
-		{`example.internal`, errNonPublic},
-		// All-numeric final label not okay.
-		{`www.zombo.163`, errNonPublic},
 	}
 
 	shouldBeTLDError := []string{
@@ -260,6 +255,7 @@ func TestExtractDomainIANASuffix_Valid(t *testing.T) {
 		// Domain equal to a private public suffix should return the ICANN public
 		// suffix.
 		{"cloudapp.net", "net"},
+		{"test.ffslfl", "ffslfl"},
 	}
 
 	for _, tc := range testCases {
